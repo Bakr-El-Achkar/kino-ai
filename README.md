@@ -1,5 +1,29 @@
 This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
+## KINO local model
+
+KINO uses an optimized Ollama model alias with the same Qwen 3.5 4.3B Q4 weights and a compact, non-duplicated system prompt. Create the alias once before starting the app:
+
+```bash
+ollama create kino-optimized -f Modelfile.kino-optimized
+```
+
+To select another installed Ollama model, set `OLLAMA_MODEL` in `.env.local`.
+
+KINO requests an 8192-token context window and caps each Ollama round at 1024 generated tokens. Override these reviewable per-request defaults with `KINO_NUM_CTX` and `KINO_NUM_PREDICT` in `.env.local`. This does not modify or recreate the installed Ollama model; the checked-in Modelfile remains the source configuration for manual model creation.
+
+The application keeps KINO loaded in memory to avoid cold-start delays. Run `ollama stop kino-optimized` when you want Ollama to release the model memory.
+
+## Private runtime state
+
+KINO keeps short-lived local web-operation state under the private
+.kino/runtime directory, which is Git ignored. Pending actions expire after
+five minutes. Read-only form drafts expire after fifteen minutes and may
+contain user-provided draft values, so the runtime files are written atomically
+with private file permissions and must not be copied into source control or
+diagnostic logs. Form drafts contain semantic field metadata only—never browser
+selectors, DOM handles, cookies, session state, or current form values.
+
 ## Getting Started
 
 First, run the development server:
