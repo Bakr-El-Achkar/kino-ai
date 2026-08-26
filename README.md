@@ -49,12 +49,27 @@ conversation, and expires inactive sessions. Its API is:
 - `GET /health`
 - `POST /browser/open`
 - `POST /browser/observe`
+- `POST /browser/state`
+- `POST /browser/screenshot`
 - `POST /browser/action`
 - `POST /browser/login`
 - `POST /browser/close`
 
 For a remote worker, set `KINO_BROWSER_WORKER_URL` to its private HTTPS address
 and protect it with network controls in addition to the Bearer token.
+
+### KINO Live Browser
+
+When a runtime browser session is active, the KINO interface polls lightweight
+page state and a protected viewport-only JPEG preview. The screenshot is taken
+from the exact Playwright Page used by the agent; no second browser or iframe is
+created. Password, one-time-code, security-code, and payment autocomplete fields
+are masked by Playwright before capture. Preview bytes travel only through the
+server-side `/api/kino/browser-view` proxy, are never sent to Ollama, and are
+served with private no-store headers.
+
+Remote gateways that allowlist browser operations must include both `state` and
+`screenshot`. Neither operation creates a browser session or modifies the page.
 
 ### URL safety
 

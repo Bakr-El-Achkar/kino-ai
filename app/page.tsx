@@ -1,7 +1,9 @@
 "use client";
 
+import Image from "next/image";
 import {
   FormEvent,
+  useCallback,
   useEffect,
   useRef,
   useState,
@@ -29,8 +31,29 @@ type LoginChallenge = {
   passwordLabel?: string;
 };
 
+type BrowserView = {
+  active: boolean;
+  status: string;
+  url?: string;
+  title?: string;
+  pageStatus?: string;
+  authentication?: LoginChallenge;
+  updatedAt?: string;
+};
+
+type BrowserPreviewState = "idle" | "starting" | "live" | "updating" | "stale" | "offline";
+
 function createId() {
   return `${Date.now()}-${Math.random()}`;
+}
+
+function browserHostname(url?: string) {
+  if (!url) return "Awaiting page";
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return "KINO Browser";
+  }
 }
 
 function renderMessageContent(content: string) {
@@ -80,6 +103,12 @@ export default function Home() {
   const [loginBusy, setLoginBusy] = useState(false);
   const [loginError, setLoginError] = useState("");
 
+  const [browserView, setBrowserView] = useState<BrowserView>({ active: false, status: "SESSION_EXPIRED" });
+  const [browserPreviewUrl, setBrowserPreviewUrl] = useState<string | null>(null);
+  const [browserPreviewState, setBrowserPreviewState] = useState<BrowserPreviewState>("idle");
+  const [browserIntent, setBrowserIntent] = useState(false);
+  const [browserCollapsed, setBrowserCollapsed] = useState(false);
+
   const [
     streamingMessageId,
     setStreamingMessageId,
@@ -93,6 +122,11 @@ export default function Home() {
 
   const conversationIdRef =
     useRef<string | null>(null);
+
+  const browserActiveRef = useRef(false);
+  const browserIntentRef = useRef(false);
+  const screenshotObjectUrlRef = useRef<string | null>(null);
+  const screenshotRequestRef = useRef(false);
 
   const isBusy =
     kinoState === "thinking" ||
@@ -119,30 +153,146 @@ export default function Home() {
     streamingMessageId,
   ]);
 
-  async function refreshBrowserState() {
+  const refreshBrowserState = useCallback(async (signal?: AbortSignal) => {
     const conversationId = conversationIdRef.current;
-    if (!conversationId) return;
+    if (!conversationId) return false;
     try {
-      const response = await fetch(
-        `/api/kino/browser-state?conversationId=${encodeURIComponent(conversationId)}`,
-        { cache: "no-store" },
-      );
-      if (!response.ok) return;
-      const state = await response.json() as {
-        observation?: {
-          status?: string;
-          authentication?: LoginChallenge;
-        };
-      };
-      if (state.observation?.status === "AUTH_REQUIRED") {
-        setLoginChallenge(state.observation.authentication ?? {});
-      } else {
-        setLoginChallenge(null);
+      const response = await fetch("/api/kino/browser-state", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ conversationId }),
+        cache: "no-store",
+        signal,
+      });
+      const state = await response.json() as BrowserView;
+      if (state.active) {
+        browserActiveRef.current = true;
+        browserIntentRef.current = false;
+        setBrowserView(state);
+        setBrowserIntent(false);
+        if (state.pageStatus === "AUTH_REQUIRED") {
+          setLoginChallenge(state.authentication ?? {});
+        } else {
+          setLoginChallenge(null);
+        }
+        return true;
       }
-    } catch {
-      // Browser operations remain optional; ordinary chat must stay usable.
+      if (state.status === "SESSION_EXPIRED") {
+        if (browserIntentRef.current) return false;
+        browserActiveRef.current = false;
+        setBrowserView({ active: false, status: state.status });
+        setBrowserIntent(false);
+        setBrowserPreviewState("idle");
+        setLoginChallenge(null);
+        const previous = screenshotObjectUrlRef.current;
+        screenshotObjectUrlRef.current = null;
+        setBrowserPreviewUrl(null);
+        if (previous) URL.revokeObjectURL(previous);
+      } else if (state.status === "WORKER_UNAVAILABLE" && browserActiveRef.current) {
+        setBrowserPreviewState(screenshotObjectUrlRef.current ? "stale" : "offline");
+      }
+      return false;
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") return browserActiveRef.current;
+      if (browserActiveRef.current) {
+        setBrowserPreviewState(screenshotObjectUrlRef.current ? "stale" : "offline");
+      }
+      return browserActiveRef.current;
     }
-  }
+  }, []);
+
+  const refreshBrowserScreenshot = useCallback(async (signal?: AbortSignal) => {
+    const conversationId = conversationIdRef.current;
+    if (!conversationId || screenshotRequestRef.current) return;
+    screenshotRequestRef.current = true;
+    if (screenshotObjectUrlRef.current) setBrowserPreviewState("updating");
+    try {
+      const response = await fetch("/api/kino/browser-view", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ conversationId }),
+        cache: "no-store",
+        signal,
+      });
+      if (!response.ok) {
+        const result = await response.json().catch(() => null) as { status?: string } | null;
+        if (result?.status === "SESSION_EXPIRED") {
+          browserActiveRef.current = false;
+          browserIntentRef.current = false;
+          setBrowserView({ active: false, status: "SESSION_EXPIRED" });
+          setBrowserIntent(false);
+          setBrowserPreviewState("idle");
+          const previous = screenshotObjectUrlRef.current;
+          screenshotObjectUrlRef.current = null;
+          setBrowserPreviewUrl(null);
+          if (previous) URL.revokeObjectURL(previous);
+        } else {
+          setBrowserPreviewState(screenshotObjectUrlRef.current ? "stale" : "offline");
+        }
+        return;
+      }
+      const blob = await response.blob();
+      if (blob.type !== "image/jpeg") throw new Error("INVALID_SCREENSHOT");
+      const nextUrl = URL.createObjectURL(blob);
+      const previous = screenshotObjectUrlRef.current;
+      screenshotObjectUrlRef.current = nextUrl;
+      setBrowserPreviewUrl(nextUrl);
+      setBrowserPreviewState("live");
+      if (previous) URL.revokeObjectURL(previous);
+    } catch (error) {
+      if (!(error instanceof Error && error.name === "AbortError")) {
+        setBrowserPreviewState(screenshotObjectUrlRef.current ? "stale" : "offline");
+      }
+    } finally {
+      screenshotRequestRef.current = false;
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      const current = screenshotObjectUrlRef.current;
+      if (current) URL.revokeObjectURL(current);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!conversationIdRef.current || (!browserIntent && !browserView.active)) return;
+    let stopped = false;
+    let running = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let controller: AbortController | null = null;
+
+    const schedule = () => {
+      if (!stopped) timer = setTimeout(tick, 1_800);
+    };
+    const tick = async () => {
+      if (stopped || running) return;
+      if (document.visibilityState === "hidden") {
+        schedule();
+        return;
+      }
+      running = true;
+      controller = new AbortController();
+      const active = await refreshBrowserState(controller.signal);
+      if (active && !browserCollapsed && !stopped) await refreshBrowserScreenshot(controller.signal);
+      running = false;
+      schedule();
+    };
+    const visibilityChanged = () => {
+      if (document.visibilityState === "visible" && !running) {
+        if (timer) clearTimeout(timer);
+        void tick();
+      }
+    };
+    void tick();
+    document.addEventListener("visibilitychange", visibilityChanged);
+    return () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+      controller?.abort();
+      document.removeEventListener("visibilitychange", visibilityChanged);
+    };
+  }, [browserCollapsed, browserIntent, browserView.active, refreshBrowserScreenshot, refreshBrowserState]);
 
   async function sendMessage(
     event?: FormEvent
@@ -198,6 +348,12 @@ export default function Home() {
     try {
       conversationIdRef.current ??=
         crypto.randomUUID();
+
+      if (/https?:\/\/|\b(?:open|visit|browse|navigate|go\s+to)\b/i.test(command)) {
+        browserIntentRef.current = true;
+        setBrowserIntent(true);
+        if (!browserActiveRef.current) setBrowserPreviewState("starting");
+      }
 
       /*
         We don't need to send our UI IDs
@@ -419,6 +575,14 @@ export default function Home() {
 
       await refreshBrowserState();
 
+      if (browserActiveRef.current && !browserCollapsed) {
+        await refreshBrowserScreenshot();
+      } else if (!browserActiveRef.current && browserIntentRef.current) {
+        browserIntentRef.current = false;
+        setBrowserIntent(false);
+        setBrowserPreviewState("idle");
+      }
+
       setKinoState("online");
     } catch (err) {
       console.error(err);
@@ -467,6 +631,8 @@ export default function Home() {
         setLoginError(result.message || "Authentication failed. Check the credentials and try again.");
       } else {
         setLoginChallenge(null);
+        await refreshBrowserState();
+        if (browserActiveRef.current && !browserCollapsed) await refreshBrowserScreenshot();
         setMessages((current) => [
           ...current,
           { id: createId(), role: "assistant", content: "Login succeeded and the authenticated browser session is ready." },
@@ -517,6 +683,17 @@ export default function Home() {
 
     return "CORE ONLINE";
   }
+
+  const showBrowserPanel = browserIntent || browserView.active;
+  const browserStatusLabel = browserPreviewState === "stale"
+    ? "STALE"
+    : browserPreviewState === "offline"
+      ? "OFFLINE"
+      : browserPreviewState === "starting"
+        ? "STARTING"
+        : browserPreviewState === "updating"
+          ? "SYNCING"
+          : "LIVE";
 
   return (
     <main
@@ -608,6 +785,7 @@ export default function Home() {
           CHAT WORKSPACE
       ============================== */}
 
+      <div className={`kino-workspace-shell ${showBrowserPanel ? "has-live-browser" : ""} ${browserCollapsed ? "browser-is-collapsed" : ""}`}>
       <section className="chat-workspace">
         <div className="chat-inner">
           {messages.map(
@@ -780,6 +958,88 @@ export default function Home() {
           <div ref={chatEndRef} />
         </div>
       </section>
+
+      {showBrowserPanel && (
+        <aside className={`live-browser-panel ${browserCollapsed ? "live-browser-panel-collapsed" : ""}`} aria-label="KINO Live Browser">
+          <div className="live-browser-header">
+            <div className="live-browser-identity">
+              <span className={`live-browser-dot live-browser-dot-${browserPreviewState}`} />
+              <div>
+                <span className="live-browser-kicker">{browserStatusLabel} BROWSER</span>
+                <strong>KINO LIVE VIEW</strong>
+              </div>
+            </div>
+            <div className="live-browser-controls">
+              {!browserCollapsed && (
+                <button
+                  type="button"
+                  onClick={() => void refreshBrowserScreenshot()}
+                  disabled={browserPreviewState === "updating"}
+                  aria-label="Refresh KINO Browser preview"
+                >
+                  ↻
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => setBrowserCollapsed((current) => !current)}
+                aria-label={browserCollapsed ? "Expand KINO Browser" : "Collapse KINO Browser"}
+              >
+                {browserCollapsed ? "＋" : "−"}
+              </button>
+            </div>
+          </div>
+
+          {!browserCollapsed && (
+            <>
+              <div className="live-browser-page-meta">
+                <div>
+                  <strong>{browserView.title || "Initializing secure viewport"}</strong>
+                  <span>{browserHostname(browserView.url)}</span>
+                </div>
+                {browserView.pageStatus && browserView.pageStatus !== "OBSERVED" && (
+                  <span className="live-browser-page-status">{browserView.pageStatus.replaceAll("_", " ")}</span>
+                )}
+              </div>
+
+              <div className={`live-browser-viewport live-browser-viewport-${browserPreviewState}`} aria-live="polite">
+                {browserPreviewUrl ? (
+                  <Image
+                    src={browserPreviewUrl}
+                    alt={`Current KINO Browser viewport: ${browserView.title || "website"}`}
+                    fill
+                    sizes="(max-width: 900px) 100vw, 46vw"
+                    unoptimized
+                    draggable={false}
+                  />
+                ) : browserPreviewState === "offline" ? (
+                  <div className="live-browser-empty-state">
+                    <span className="live-browser-offline-mark">!</span>
+                    <strong>KINO Browser temporarily unavailable</strong>
+                    <small>Chat remains online. The preview will reconnect automatically.</small>
+                  </div>
+                ) : (
+                  <div className="live-browser-empty-state live-browser-starting">
+                    <span className="live-browser-scan" />
+                    <strong>Initializing isolated viewport</strong>
+                    <small>KINO is connecting to the controlled browser session.</small>
+                  </div>
+                )}
+                {browserPreviewUrl && browserPreviewState === "updating" && <span className="live-browser-sync-line" />}
+                {browserPreviewUrl && browserPreviewState === "stale" && (
+                  <span className="live-browser-stale-note">Preview connection interrupted · showing last frame</span>
+                )}
+              </div>
+
+              <div className="live-browser-location" title={browserView.url || ""}>
+                <span>SECURE VIEW</span>
+                <p>{browserView.url || "Waiting for KINO Browser…"}</p>
+              </div>
+            </>
+          )}
+        </aside>
+      )}
+      </div>
 
       {/* =============================
           COMMAND AREA

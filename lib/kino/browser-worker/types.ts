@@ -1,6 +1,7 @@
 export type BrowserStatus =
   | "OPENED"
   | "OBSERVED"
+  | "SCREENSHOT_READY"
   | "AUTH_REQUIRED"
   | "AUTH_SUCCESS"
   | "AUTH_FAILED"
@@ -109,6 +110,25 @@ export type BrowserSessionState = {
   message: string;
   observation?: BrowserObservation;
   pendingAction?: PendingBrowserAction;
+};
+
+export type BrowserViewState = {
+  success: boolean;
+  status: BrowserStatus;
+  message: string;
+  active: boolean;
+  url?: string;
+  title?: string;
+  pageStatus?: BrowserObservation["status"];
+  authentication?: AuthenticationChallenge;
+  updatedAt?: string;
+};
+
+export type BrowserScreenshot = {
+  success: true;
+  status: "SCREENSHOT_READY";
+  contentType: "image/jpeg";
+  bytes: ArrayBuffer;
 };
 
 export type BrowserGoalResult = {

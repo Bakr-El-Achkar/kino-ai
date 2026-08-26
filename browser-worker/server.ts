@@ -1,7 +1,7 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 
-import { cleanupExpiredSessions, closeSession, loginSession, observeSession, openUrl, performAction, shutdownWorker } from "./sessions.ts";
+import { browserViewState, cleanupExpiredSessions, closeSession, loginSession, observeSession, openUrl, performAction, screenshotSession, shutdownWorker } from "./sessions.ts";
 
 const host = process.env.KINO_BROWSER_WORKER_HOST?.trim() || "127.0.0.1";
 const port = Number.parseInt(process.env.KINO_BROWSER_WORKER_PORT ?? "8787", 10);
@@ -20,6 +20,16 @@ function json(response: ServerResponse, status: number, body: unknown) {
     "X-Content-Type-Options": "nosniff",
   });
   response.end(JSON.stringify(body));
+}
+
+function jpeg(response: ServerResponse, bytes: Buffer) {
+  response.writeHead(200, {
+    "Content-Type": "image/jpeg",
+    "Content-Length": bytes.byteLength,
+    "Cache-Control": "no-store, private",
+    "X-Content-Type-Options": "nosniff",
+  });
+  response.end(bytes);
 }
 
 function authorized(request: IncomingMessage) {
@@ -71,6 +81,15 @@ const server = createServer(async (request, response) => {
       result = await openUrl(sessionId, typeof payload.url === "string" ? payload.url : "");
     } else if (request.url === "/browser/observe") {
       result = await observeSession(sessionId);
+    } else if (request.url === "/browser/state") {
+      result = await browserViewState(sessionId);
+    } else if (request.url === "/browser/screenshot") {
+      const screenshot = await screenshotSession(sessionId);
+      if ("bytes" in screenshot) {
+        jpeg(response, screenshot.bytes);
+        return;
+      }
+      result = screenshot;
     } else if (request.url === "/browser/action") {
       result = await performAction(sessionId, {
         action: typeof payload.action === "string" ? payload.action : "",

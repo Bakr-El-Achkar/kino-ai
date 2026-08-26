@@ -5,7 +5,7 @@ import { chromium, type Browser, type BrowserContext, type Locator, type Page } 
 import { buildCriticalConfirmationPhrase, parseActionConfirmation } from "../lib/kino/web-agent/action-confirmation.ts";
 import { classifyActionRisk } from "../lib/kino/web-agent/action-risk.ts";
 import { isSensitiveFormField } from "../lib/kino/web-agent/form-matcher.ts";
-import type { BrowserActionKind, BrowserActionResult, BrowserOpenResult, BrowserSessionState, PendingBrowserAction } from "../lib/kino/browser-worker/types.ts";
+import type { BrowserActionKind, BrowserActionResult, BrowserObservation, BrowserOpenResult, BrowserSessionState, BrowserViewState, PendingBrowserAction } from "../lib/kino/browser-worker/types.ts";
 import { observePage, type ElementRegistry, type RegisteredElement } from "./observer.ts";
 import { developmentPrivateNetworkEscapeEnabled, routedRequestProtocolPolicy, validatePublicUrl } from "./url-security.ts";
 
@@ -40,6 +40,7 @@ type BrowserSession = {
   context: BrowserContext;
   page: Page;
   registry: ElementRegistry;
+  lastObservation?: BrowserObservation;
   pending?: InternalPendingAction;
   lastActive: number;
   navigationBlocked?: string;
@@ -156,7 +157,81 @@ async function observation(session: BrowserSession) {
   const result = await observePage(session.page, session.registry);
   result.learnedNavigation.forEach((name) => session.learnedNavigation.add(name));
   result.learnedNavigation = Array.from(session.learnedNavigation).slice(-60);
+  session.lastObservation = result;
   return result;
+}
+
+function safeViewUrl(value: string) {
+  const url = new URL(value);
+  url.username = "";
+  url.password = "";
+  url.search = "";
+  url.hash = "";
+  return url.href;
+}
+
+export async function browserViewState(sessionId: string): Promise<BrowserViewState> {
+  const session = activeSession(sessionId);
+  if (!session) {
+    return { success: false, status: "SESSION_EXPIRED", message: "The browser session expired or does not exist.", active: false };
+  }
+  try {
+    return {
+      success: true,
+      status: session.lastObservation?.status ?? "OBSERVED",
+      message: "The active browser page state is available.",
+      active: true,
+      url: safeViewUrl(session.page.url()),
+      title: (await session.page.title()).slice(0, 300),
+      pageStatus: session.lastObservation?.status,
+      authentication: session.lastObservation?.authentication,
+      updatedAt: new Date().toISOString(),
+    };
+  } catch {
+    return { success: false, status: "SESSION_EXPIRED", message: "The browser session expired or does not exist.", active: false };
+  }
+}
+
+const SENSITIVE_SCREENSHOT_SELECTOR = [
+  'input[type="password"]',
+  'input[autocomplete~="current-password" i]',
+  'input[autocomplete~="new-password" i]',
+  'input[autocomplete~="one-time-code" i]',
+  'input[autocomplete~="cc-number" i]',
+  'input[autocomplete~="cc-csc" i]',
+  'input[autocomplete~="cc-exp" i]',
+  'input[autocomplete~="cc-exp-month" i]',
+  'input[autocomplete~="cc-exp-year" i]',
+  'input[name*="password" i]',
+  'input[id*="password" i]',
+  'input[name*="security-code" i]',
+  'input[id*="security-code" i]',
+].join(",");
+
+export async function screenshotSession(sessionId: string) {
+  const session = activeSession(sessionId);
+  if (!session) return failure("SESSION_EXPIRED", "The browser session expired or does not exist.");
+  try {
+    const mask = [session.page.locator(SENSITIVE_SCREENSHOT_SELECTOR)];
+    for (const entry of session.registry.values()) {
+      if (entry.semantic.inputType === "password" || isSensitiveFormField({ name: entry.semantic.name })) {
+        mask.push(entry.locator);
+      }
+    }
+    const bytes = await session.page.screenshot({
+      type: "jpeg",
+      quality: 76,
+      fullPage: false,
+      animations: "disabled",
+      caret: "hide",
+      mask,
+      maskColor: "#07141a",
+      timeout: 12_000,
+    });
+    return { success: true as const, status: "SCREENSHOT_READY" as const, message: "The current browser viewport was captured.", bytes };
+  } catch {
+    return failure("ACTION_FAILED", "The browser viewport could not be captured.");
+  }
 }
 
 export async function openUrl(sessionId: string, value: string): Promise<BrowserOpenResult> {

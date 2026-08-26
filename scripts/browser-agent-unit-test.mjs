@@ -68,6 +68,13 @@ delete process.env.KINO_BROWSER_WORKER_TOKEN;
 assert.equal(browserSessionId("123e4567-e89b-42d3-a456-426614174000"), null);
 assert.equal((await observeBrowser("123e4567-e89b-42d3-a456-426614174000")).status, "WORKER_UNAVAILABLE");
 
+const workerPreviewServer = createServer((_request, response) => {
+  response.writeHead(200, { "Content-Type": "text/html" });
+  response.end(`<title>Screenshot integration</title><h1>KINO Browser frame</h1><label>Password <input type="password" value="must-never-appear"></label><label>OTP <input autocomplete="one-time-code" value="123456"></label><a href="/next">Next</a>`);
+});
+await new Promise((resolve) => workerPreviewServer.listen(0, "127.0.0.1", resolve));
+const workerPreviewAddress = workerPreviewServer.address();
+assert.ok(workerPreviewAddress && typeof workerPreviewAddress === "object");
 const workerPort = 32_000 + Math.floor(Math.random() * 8_000);
 const workerProcess = spawn(process.execPath, ["--experimental-strip-types", "browser-worker/server.ts"], {
   cwd: process.cwd(),
@@ -76,6 +83,7 @@ const workerProcess = spawn(process.execPath, ["--experimental-strip-types", "br
     KINO_BROWSER_WORKER_HOST: "127.0.0.1",
     KINO_BROWSER_WORKER_PORT: String(workerPort),
     KINO_BROWSER_WORKER_TOKEN: "integration-worker-token-123456",
+    KINO_BROWSER_ALLOW_PRIVATE_NETWORKS: "true",
   },
   stdio: ["ignore", "pipe", "pipe"],
 });
@@ -107,9 +115,59 @@ try {
     body: unauthorizedBody,
   });
   assert.equal(wrongAuthorization.status, 401);
+  const missingScreenshotAuthorization = await fetch(`http://127.0.0.1:${workerPort}/browser/screenshot`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: unauthorizedBody,
+  });
+  assert.equal(missingScreenshotAuthorization.status, 401);
+
+  const workerHeaders = { Authorization: "Bearer integration-worker-token-123456", "Content-Type": "application/json" };
+  const unknownScreenshot = await fetch(`http://127.0.0.1:${workerPort}/browser/screenshot`, {
+    method: "POST",
+    headers: workerHeaders,
+    body: unauthorizedBody,
+  });
+  assert.equal(unknownScreenshot.status, 409);
+  assert.equal((await unknownScreenshot.json()).status, "SESSION_EXPIRED");
+
+  const screenshotSessionId = "b".repeat(64);
+  const workerOpen = await fetch(`http://127.0.0.1:${workerPort}/browser/open`, {
+    method: "POST",
+    headers: workerHeaders,
+    body: JSON.stringify({ sessionId: screenshotSessionId, url: `http://127.0.0.1:${workerPreviewAddress.port}` }),
+  });
+  assert.equal(workerOpen.status, 200);
+  const workerState = await fetch(`http://127.0.0.1:${workerPort}/browser/state`, {
+    method: "POST",
+    headers: workerHeaders,
+    body: JSON.stringify({ sessionId: screenshotSessionId }),
+  });
+  const workerStateBody = await workerState.json();
+  assert.equal(workerStateBody.active, true);
+  assert.equal(workerStateBody.title, "Screenshot integration");
+  const screenshotResponse = await fetch(`http://127.0.0.1:${workerPort}/browser/screenshot`, {
+    method: "POST",
+    headers: workerHeaders,
+    body: JSON.stringify({ sessionId: screenshotSessionId }),
+  });
+  assert.equal(screenshotResponse.status, 200);
+  assert.equal(screenshotResponse.headers.get("content-type"), "image/jpeg");
+  assert.equal(screenshotResponse.headers.get("cache-control"), "no-store, private");
+  const screenshotBytes = new Uint8Array(await screenshotResponse.arrayBuffer());
+  assert.ok(screenshotBytes.byteLength > 1_000);
+  assert.equal(screenshotBytes[0], 0xff);
+  assert.equal(screenshotBytes[1], 0xd8);
+  assert.equal(Buffer.from(screenshotBytes).includes(Buffer.from("integration-worker-token-123456")), false);
+  await fetch(`http://127.0.0.1:${workerPort}/browser/close`, {
+    method: "POST",
+    headers: workerHeaders,
+    body: JSON.stringify({ sessionId: screenshotSessionId }),
+  });
 } finally {
   workerProcess.kill();
   await new Promise((resolve) => workerProcess.once("exit", resolve));
+  await new Promise((resolve, reject) => workerPreviewServer.close((error) => error ? reject(error) : resolve()));
 }
 
 // Development-only loopback browsing proves openUrl has no connection-registry dependency.
@@ -144,6 +202,8 @@ const arbitraryOpen = await openUrl(arbitrarySessionId, `http://127.0.0.1:${addr
 assert.equal(arbitraryOpen.success, true);
 assert.equal(arbitraryOpen.status, "OPENED");
 assert.equal(arbitraryOpen.observation?.title, "Arbitrary test site");
+assert.match(formatBrowserToolResponse(arbitraryOpen), /Opened in KINO Browser/);
+assert.doesNotMatch(formatBrowserToolResponse(arbitraryOpen), /your (?:computer|browser)|local (?:window|tab)/i);
 const nextLink = arbitraryOpen.observation?.elements.find((element) => element.name === "Next area");
 assert.ok(nextLink);
 const navigationResult = await performAction(arbitrarySessionId, { action: "click", elementId: nextLink.id });
@@ -287,13 +347,53 @@ assert.match(workerSource, /effectVerified/);
 assert.doesNotMatch(workerSource, /role: "button", name: pending/);
 assert.match(workerSource, /pendingElementStillMatches/);
 assert.match(workerSource, /ACTION_UNVERIFIED/);
+assert.match(workerSource, /animations: "disabled"/);
+assert.match(workerSource, /caret: "hide"/);
+assert.match(workerSource, /SENSITIVE_SCREENSHOT_SELECTOR/);
+for (const sensitiveAttribute of [
+  "password", "current-password", "new-password", "one-time-code", "cc-number",
+  "cc-csc", "cc-exp", "cc-exp-month", "cc-exp-year",
+]) {
+  assert.match(workerSource, new RegExp(sensitiveAttribute), sensitiveAttribute);
+}
+const screenshotSection = workerSource.slice(
+  workerSource.indexOf("export async function screenshotSession"),
+  workerSource.indexOf("export async function openUrl"),
+);
+assert.doesNotMatch(screenshotSection, /inputValue|evaluate|textContent|innerText/);
 const workerServerSource = readFileSync("browser-worker/server.ts", "utf8");
 assert.match(workerServerSource, /timingSafeEqual/);
 assert.match(workerServerSource, /service: "kino-browser-worker"/);
 assert.doesNotMatch(workerServerSource, /activeSessions/);
 assert.doesNotMatch(workerServerSource, /console\.(?:log|info|error).*authorization/i);
+assert.match(workerServerSource, /"\/browser\/screenshot"/);
+assert.match(workerServerSource, /"Content-Type": "image\/jpeg"/);
 const workerClientSource = readFileSync("lib/kino/browser-worker/client.ts", "utf8");
 assert.doesNotMatch(workerClientSource, /local-unconfigured-worker/);
+assert.doesNotMatch(workerClientSource, /NEXT_PUBLIC_/);
+const browserViewRouteSource = readFileSync("app/api/kino/browser-view/route.ts", "utf8");
+assert.match(browserViewRouteSource, /sameOrigin/);
+assert.match(browserViewRouteSource, /captureBrowserScreenshot/);
+assert.doesNotMatch(browserViewRouteSource, /KINO_BROWSER_WORKER_(?:TOKEN|URL)|playwright/i);
+const browserStateSection = workerSource.slice(
+  workerSource.indexOf("export async function browserViewState"),
+  workerSource.indexOf("const SENSITIVE_SCREENSHOT_SELECTOR"),
+);
+assert.doesNotMatch(browserStateSection, /createSession|observePage|page\.(?:goto|click|fill|reload)/);
+const pageSource = readFileSync("app/page.tsx", "utf8");
+assert.match(pageSource, /URL\.createObjectURL/);
+assert.match(pageSource, /URL\.revokeObjectURL/);
+assert.match(pageSource, /visibilityState/);
+assert.match(pageSource, /screenshotRequestRef\.current/);
+assert.match(pageSource, /controller\?\.abort\(\)/);
+assert.match(pageSource, /clearTimeout\(timer\)/);
+assert.doesNotMatch(pageSource, /playwright|KINO_BROWSER_WORKER_(?:TOKEN|URL)/i);
+const pollingSection = pageSource.slice(
+  pageSource.indexOf("const refreshBrowserState"),
+  pageSource.indexOf("async function sendMessage"),
+);
+assert.doesNotMatch(pollingSection, /ollama|fetch\("\/api\/kino"\)/i);
+assert.match(controllerSource, /Ordinary page navigation is a read action/);
 const loginSection = workerSource.slice(
   workerSource.indexOf("export async function loginSession"),
   workerSource.indexOf("export async function closeSession"),

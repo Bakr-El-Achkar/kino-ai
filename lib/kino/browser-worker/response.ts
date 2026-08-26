@@ -44,6 +44,9 @@ export function formatBrowserToolResponse(toolResult: unknown) {
     return text(result.message) || "The control was activated, but completion could not be strongly verified.";
   }
   const observation = record(result.observation) as BrowserObservation | null;
-  if (observation) return formatObservation(observation);
+  if (observation) {
+    const formatted = formatObservation(observation);
+    return result.status === "OPENED" ? `Opened in KINO Browser.\n\n${formatted}` : formatted;
+  }
   return text(result.message) || "The browser operation completed without a verifiable page observation.";
 }
