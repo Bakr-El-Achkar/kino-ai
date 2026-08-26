@@ -34,10 +34,7 @@ export type KinoTool = {
   /*
     Unique name visible to the AI.
 
-    Examples:
-
-    cleannest_get_bookings
-    storeflow_get_inventory
+    Examples include built-in or worker-backed capability names.
   */
   name: string;
 

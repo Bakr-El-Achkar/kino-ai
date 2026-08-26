@@ -1621,6 +1621,19 @@ footer span:last-child {
   word-break: break-word;
 }
 
+.message-bubble a {
+  color: rgba(89, 211, 244, 0.95);
+  text-decoration: underline;
+  text-decoration-color: rgba(89, 211, 244, 0.45);
+  text-underline-offset: 3px;
+}
+
+.message-bubble a:hover,
+.message-bubble a:focus-visible {
+  color: #bdefff;
+  text-decoration-color: currentColor;
+}
+
 .kino-bubble {
   color:
     rgba(218, 243, 251, 0.82);
@@ -2182,145 +2195,98 @@ footer span:last-child {
   }
 }
 
-/* =========================================================
-   EPHEMERAL SECURE FORM ENTRY
-========================================================= */
-
-.secure-entry-row {
+/* Secure credentials are posted directly to the server-side worker proxy. */
+.secure-login-row {
   align-items: stretch;
 }
 
-.secure-entry-card {
+.secure-login-card {
+  display: grid;
   width: min(560px, 76vw);
+  gap: 9px;
   padding: 18px;
   border: 1px solid rgba(110, 229, 255, 0.2);
   border-radius: 4px 15px 15px 15px;
   background: linear-gradient(135deg, rgba(4, 35, 47, 0.94), rgba(2, 18, 26, 0.96));
-  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.2), inset 0 0 24px rgba(0, 190, 240, 0.025);
+  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.2);
 }
 
-.secure-entry-heading {
+.secure-login-heading {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
   gap: 18px;
-  margin-bottom: 15px;
+  margin-bottom: 6px;
 }
 
-.secure-entry-heading > div {
+.secure-login-heading > div {
   display: flex;
   flex-direction: column;
   gap: 5px;
 }
 
-.secure-entry-heading span,
-.secure-entry-card small {
-  color: rgba(115, 207, 233, 0.5);
-  font-size: 7px;
-  letter-spacing: 1.5px;
+.secure-login-heading span,
+.secure-login-card small,
+.secure-login-card label {
+  color: rgba(115, 207, 233, 0.58);
+  font-size: 8px;
+  letter-spacing: 1.2px;
 }
 
-.secure-entry-heading strong {
+.secure-login-heading strong {
   color: rgba(224, 249, 255, 0.92);
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 500;
 }
 
-.secure-entry-badge {
+.secure-login-badge {
   padding: 5px 7px;
   border: 1px solid rgba(83, 231, 194, 0.22);
   color: rgba(104, 238, 202, 0.72) !important;
   background: rgba(46, 190, 153, 0.06);
 }
 
-.secure-entry-card form {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.secure-entry-card label,
-.secure-entry-staged p {
-  color: rgba(188, 222, 232, 0.66);
-  font-size: 10px;
-  line-height: 1.55;
-}
-
-.secure-entry-card input {
+.secure-login-card input {
   width: 100%;
-  padding: 12px 13px;
+  padding: 11px 12px;
   border: 1px solid rgba(91, 219, 255, 0.22);
   outline: none;
   background: rgba(0, 8, 12, 0.72);
   color: #e8fbff;
-  font-size: 15px;
-  letter-spacing: 2px;
+  font-size: 14px;
 }
 
-.secure-entry-card input:focus {
+.secure-login-card input:focus {
   border-color: rgba(102, 231, 255, 0.55);
-  box-shadow: 0 0 20px rgba(0, 194, 255, 0.07);
 }
 
-.secure-entry-actions,
-.secure-entry-staged {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-}
-
-.secure-entry-actions button,
-.secure-entry-staged button {
-  min-height: 34px;
-  padding: 0 14px;
+.secure-login-card button {
+  min-height: 36px;
   border: 1px solid rgba(91, 219, 255, 0.25);
   background: rgba(0, 151, 200, 0.11);
   color: #7be7ff;
-  font-size: 7px;
+  font-size: 8px;
   letter-spacing: 1.3px;
   cursor: pointer;
 }
 
-.secure-entry-actions button:disabled,
-.secure-entry-staged button:disabled {
+.secure-login-card button:disabled {
   cursor: not-allowed;
-  opacity: 0.35;
+  opacity: 0.4;
 }
 
-.secure-entry-actions .secure-cancel-button,
-.secure-entry-staged .secure-cancel-button {
-  border-color: rgba(171, 195, 204, 0.14);
-  background: rgba(124, 148, 157, 0.05);
-  color: rgba(180, 205, 214, 0.55);
-}
-
-.secure-entry-staged {
-  margin-bottom: 12px;
-}
-
-.secure-entry-staged > span {
-  color: #55e8c1;
-}
-
-.secure-entry-staged p {
-  flex: 1;
-  margin: 0;
-}
-
-.secure-entry-error {
-  margin: 8px 0;
+.secure-login-error {
+  margin: 2px 0;
   color: rgba(255, 135, 153, 0.9);
   font-size: 9px;
 }
 
 @media (max-width: 700px) {
-  .secure-entry-card {
+  .secure-login-card {
     width: calc(100vw - 75px);
   }
 
-  .secure-entry-heading,
-  .secure-entry-staged {
-    align-items: stretch;
+  .secure-login-heading {
     flex-direction: column;
   }
 }

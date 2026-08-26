@@ -24,6 +24,69 @@ with private file permissions and must not be copied into source control or
 diagnostic logs. Form drafts contain semantic field metadata only—never browser
 selectors, DOM handles, cookies, session state, or current form values.
 
+## General browser operator
+
+KINO's Next.js controller and its persistent Playwright runtime are separate
+processes. The Vercel application imports only a lightweight HTTP client;
+Chromium, page locators, cookies, and authentication state stay in the browser
+worker. Arbitrary public HTTP(S) URLs do not require a `.kino/connections`
+record. Saved connections are legacy/optional convenience data only.
+
+Copy the browser-related values from `.env.example` into `.env.local`, choose a
+long random shared token, and use the same token in the Next.js and worker
+environments. Never prefix this token with `NEXT_PUBLIC_`.
+
+Start the persistent worker in a separate terminal:
+
+```bash
+npm run browser-worker
+```
+
+The worker defaults to `127.0.0.1:8787`, requires Bearer authentication on all
+`/browser/*` endpoints, keeps one runtime-only BrowserContext per KINO
+conversation, and expires inactive sessions. Its API is:
+
+- `GET /health`
+- `POST /browser/open`
+- `POST /browser/observe`
+- `POST /browser/action`
+- `POST /browser/login`
+- `POST /browser/close`
+
+For a remote worker, set `KINO_BROWSER_WORKER_URL` to its private HTTPS address
+and protect it with network controls in addition to the Bearer token.
+
+### URL safety
+
+Only public HTTP(S) navigation is allowed. KINO rejects embedded URL
+credentials, non-web protocols, localhost/internal hostnames, private,
+loopback, link-local, carrier-grade NAT, documentation/reserved networks, and
+cloud metadata targets. DNS results and every main-frame redirect are checked.
+`KINO_BROWSER_ALLOW_PRIVATE_NETWORKS=true` is a development-only escape hatch
+and has no effect when `NODE_ENV=production`.
+
+### Secure login
+
+When the trusted page observer finds a login form, the KINO UI displays
+dedicated username and password fields. They are posted to
+`/api/kino/browser-login`, forwarded server-to-server to `/browser/login`, used
+only by the worker to fill the discovered login form, and removed from request
+objects/references after use. They are never added to chat history, Ollama
+messages, model tool arguments, logs, API responses, or plaintext files.
+Authenticated cookies remain only inside the runtime BrowserContext. CAPTCHA,
+MFA, OTP, WebAuthn, and human-verification challenges stop automation.
+
+### Autonomous and confirmed actions
+
+The model acts only on temporary semantic IDs (for example `e3`) emitted by the
+worker's accessible page observer. CSS, XPath, arbitrary JavaScript, and raw DOM
+execution are not accepted. Each action returns a fresh observation, allowing
+KINO to repeat observe → reason → act → verify up to
+`KINO_BROWSER_MAX_STEPS`. Duplicate steps, runtime limits, and missing progress
+stop the loop. Final write actions are held as exact pending actions; critical
+actions require a generated strong confirmation phrase. The worker revalidates
+the page/control and verifies the resulting state before reporting success.
+
 ## Getting Started
 
 First, run the development server:

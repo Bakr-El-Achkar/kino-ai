@@ -24,15 +24,29 @@ type ReasoningMode =
   | "fast"
   | "deep";
 
-type SecureFormRequest = {
-  secureRequestId: string;
-  stage: "awaiting_secure_value" | "awaiting_confirmation";
-  fieldName: string;
-  expiresInSeconds?: number;
+type LoginChallenge = {
+  usernameLabel?: string;
+  passwordLabel?: string;
 };
 
 function createId() {
   return `${Date.now()}-${Math.random()}`;
+}
+
+function renderMessageContent(content: string) {
+  return content.split(/(https?:\/\/[^\s<]+)/g).map((part, index) => {
+    if (!/^https?:\/\//i.test(part)) return part;
+    const url = part.replace(/[.,!?;:)}\]]+$/, "");
+    const trailing = part.slice(url.length);
+    return (
+      <span key={`${url}-${index}`}>
+        <a href={url} target="_blank" rel="noopener noreferrer">
+          {url}
+        </a>
+        {trailing}
+      </span>
+    );
+  });
 }
 
 export default function Home() {
@@ -58,17 +72,13 @@ export default function Home() {
   const [error, setError] =
     useState("");
 
-  const [secureRequest, setSecureRequest] =
-    useState<SecureFormRequest | null>(null);
+  const [loginChallenge, setLoginChallenge] =
+    useState<LoginChallenge | null>(null);
 
-  const [secureValue, setSecureValue] =
-    useState("");
-
-  const [secureBusy, setSecureBusy] =
-    useState(false);
-
-  const [secureError, setSecureError] =
-    useState("");
+  const [loginUsername, setLoginUsername] = useState("");
+  const [loginPassword, setLoginPassword] = useState("");
+  const [loginBusy, setLoginBusy] = useState(false);
+  const [loginError, setLoginError] = useState("");
 
   const [
     streamingMessageId,
@@ -84,75 +94,12 @@ export default function Home() {
   const conversationIdRef =
     useRef<string | null>(null);
 
-  const secureSubmissionRef =
-    useRef(false);
-
   const isBusy =
     kinoState === "thinking" ||
     kinoState === "responding";
 
   const isDeepMode =
     mode === "deep";
-
-  const awaitingSecureValue =
-    secureRequest?.stage === "awaiting_secure_value";
-
-  async function refreshSecureRequest() {
-    const conversationId = conversationIdRef.current;
-    if (!conversationId) {
-      setSecureRequest(null);
-      return;
-    }
-    try {
-      const response = await fetch(
-        `/api/kino/secure-form-value?conversationId=${encodeURIComponent(conversationId)}`,
-        { cache: "no-store" },
-      );
-      if (!response.ok) return;
-      const state = await response.json() as {
-        exists?: boolean;
-        secureRequestId?: string;
-        stage?: string;
-        fieldName?: string;
-        expiresInSeconds?: number;
-      };
-      if (
-        state.exists === true &&
-        typeof state.secureRequestId === "string" &&
-        typeof state.fieldName === "string" &&
-        (state.stage === "awaiting_secure_value" ||
-          state.stage === "awaiting_confirmation")
-      ) {
-        setSecureRequest({
-          secureRequestId: state.secureRequestId,
-          stage: state.stage,
-          fieldName: state.fieldName,
-          expiresInSeconds: state.expiresInSeconds,
-        });
-      } else {
-        setSecureRequest(null);
-        setSecureValue("");
-      }
-    } catch {
-      // Chat remains usable if safe metadata refresh is temporarily unavailable.
-    }
-  }
-
-  useEffect(() => {
-    if (!secureRequest || !conversationIdRef.current) return;
-    const conversationId = conversationIdRef.current;
-    const secureRequestId = secureRequest.secureRequestId;
-    const discardOnPageExit = () => {
-      void fetch("/api/kino/secure-form-value", {
-        method: "DELETE",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ conversationId, secureRequestId }),
-        keepalive: true,
-      });
-    };
-    window.addEventListener("pagehide", discardOnPageExit);
-    return () => window.removeEventListener("pagehide", discardOnPageExit);
-  }, [secureRequest]);
 
   /*
     Automatically follow KINO's answer
@@ -172,6 +119,31 @@ export default function Home() {
     streamingMessageId,
   ]);
 
+  async function refreshBrowserState() {
+    const conversationId = conversationIdRef.current;
+    if (!conversationId) return;
+    try {
+      const response = await fetch(
+        `/api/kino/browser-state?conversationId=${encodeURIComponent(conversationId)}`,
+        { cache: "no-store" },
+      );
+      if (!response.ok) return;
+      const state = await response.json() as {
+        observation?: {
+          status?: string;
+          authentication?: LoginChallenge;
+        };
+      };
+      if (state.observation?.status === "AUTH_REQUIRED") {
+        setLoginChallenge(state.observation.authentication ?? {});
+      } else {
+        setLoginChallenge(null);
+      }
+    } catch {
+      // Browser operations remain optional; ordinary chat must stay usable.
+    }
+  }
+
   async function sendMessage(
     event?: FormEvent
   ) {
@@ -184,14 +156,17 @@ export default function Home() {
       return;
     }
 
-    if (awaitingSecureValue) {
+    if (
+      loginChallenge &&
+      /\b(?:password|passcode|pin)\s*(?:is|:|=)|\b(?:username|email)\s*(?:is|:|=).+\bpassword\b/i.test(command)
+    ) {
       setInput("");
       setMessages((current) => [
         ...current,
         {
           id: createId(),
           role: "assistant",
-          content: `Please use the secure ${secureRequest.fieldName} field so the value does not become part of the AI conversation.`,
+          content: "Do not type credentials into chat. Use the secure login fields below; they bypass the AI model.",
         },
       ]);
       return;
@@ -442,7 +417,7 @@ export default function Home() {
         null
       );
 
-      await refreshSecureRequest();
+      await refreshBrowserState();
 
       setKinoState("online");
     } catch (err) {
@@ -467,98 +442,40 @@ export default function Home() {
     }
   }
 
-  async function submitSecureValue(event: FormEvent) {
+  async function submitSecureLogin(event: FormEvent) {
     event.preventDefault();
-    if (
-      !secureRequest ||
-      secureRequest.stage !== "awaiting_secure_value" ||
-      !conversationIdRef.current ||
-      !secureValue ||
-      secureSubmissionRef.current
-    ) return;
-
-    secureSubmissionRef.current = true;
-    setSecureBusy(true);
-    setSecureError("");
-    const requestPromise = fetch("/api/kino/secure-form-value", {
+    if (!conversationIdRef.current || !loginUsername || !loginPassword || loginBusy) return;
+    setLoginBusy(true);
+    setLoginError("");
+    const request = fetch("/api/kino/browser-login", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         conversationId: conversationIdRef.current,
-        secureRequestId: secureRequest.secureRequestId,
-        value: secureValue,
+        username: loginUsername,
+        password: loginPassword,
       }),
     });
-    setSecureValue("");
+    setLoginUsername("");
+    setLoginPassword("");
     try {
-      const response = await requestPromise;
-      const result = await response.json() as {
-        success?: boolean;
-        status?: string;
-        fieldName?: string;
-        expiresInSeconds?: number;
-      };
-      if (!response.ok || result.success !== true) {
-        throw new Error(
-          result.status === "SENSITIVE_VALUE_CONSTRAINT_FAILED"
-            ? "The secure value does not satisfy the field constraints."
-            : "The secure value could not be staged. Request a new secure field if it expired.",
-        );
+      const response = await request;
+      const result = await response.json() as { success?: boolean; status?: string; message?: string };
+      if (result.status === "MFA_REQUIRED" || result.status === "CAPTCHA_REQUIRED") {
+        setLoginError("Human verification is required in the browser session.");
+      } else if (!response.ok || result.success !== true || result.status !== "AUTH_SUCCESS") {
+        setLoginError(result.message || "Authentication failed. Check the credentials and try again.");
+      } else {
+        setLoginChallenge(null);
+        setMessages((current) => [
+          ...current,
+          { id: createId(), role: "assistant", content: "Login succeeded and the authenticated browser session is ready." },
+        ]);
       }
-      const fieldName = result.fieldName ?? secureRequest.fieldName;
-      setSecureRequest({
-        secureRequestId: secureRequest.secureRequestId,
-        stage: "awaiting_confirmation",
-        fieldName,
-        expiresInSeconds: result.expiresInSeconds,
-      });
-      setMessages((current) => [
-        ...current,
-        {
-          id: createId(),
-          role: "assistant",
-          content: `Sensitive value received securely for ${fieldName}. It has not been stored persistently. Confirm to fill it. The form will not be submitted.`,
-        },
-      ]);
-    } catch (secureFailure) {
-      setSecureError(
-        secureFailure instanceof Error
-          ? secureFailure.message
-          : "The secure value could not be staged.",
-      );
-    } finally {
-      secureSubmissionRef.current = false;
-      setSecureBusy(false);
-    }
-  }
-
-  async function cancelSecureRequest() {
-    if (!secureRequest || !conversationIdRef.current || secureBusy) return;
-    const conversationId = conversationIdRef.current;
-    const secureRequestId = secureRequest.secureRequestId;
-    const fieldName = secureRequest.fieldName;
-    setSecureValue("");
-    setSecureBusy(true);
-    setSecureError("");
-    try {
-      await fetch("/api/kino/secure-form-value", {
-        method: "DELETE",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ conversationId, secureRequestId }),
-      });
-      setSecureRequest(null);
-      setMessages((current) => [
-        ...current,
-        {
-          id: createId(),
-          role: "assistant",
-          content: `Secure entry for ${fieldName} was cancelled. No sensitive value was retained or filled.`,
-        },
-      ]);
     } catch {
-      setSecureError("The secure request could not be cancelled. It will expire automatically.");
+      setLoginError("The secure login service is currently unavailable.");
     } finally {
-      setSecureBusy(false);
+      setLoginBusy(false);
     }
   }
 
@@ -748,7 +665,7 @@ export default function Home() {
                           : ""
                       }`}
                     >
-                      {message.content}
+                      {renderMessageContent(message.content)}
 
                       {isStreaming && (
                         <span className="typing-cursor">
@@ -768,75 +685,45 @@ export default function Home() {
             }
           )}
 
-          {secureRequest && (
-            <div className="chat-row chat-row-kino secure-entry-row">
+          {loginChallenge && (
+            <div className="chat-row chat-row-kino secure-login-row">
               <div className="message-avatar kino-avatar">K</div>
-              <div className="secure-entry-card" aria-live="polite">
-                <div className="secure-entry-heading">
+              <form className="secure-login-card" onSubmit={submitSecureLogin}>
+                <div className="secure-login-heading">
                   <div>
-                    <span>SECURE VALUE REQUIRED</span>
-                    <strong>{secureRequest.fieldName}</strong>
+                    <span>SECURE BROWSER LOGIN</span>
+                    <strong>Credentials bypass the AI model</strong>
                   </div>
-                  <span className="secure-entry-badge">MEMORY ONLY</span>
+                  <span className="secure-login-badge">WORKER ONLY</span>
                 </div>
-
-                {secureRequest.stage === "awaiting_secure_value" ? (
-                  <form onSubmit={submitSecureValue}>
-                    <label htmlFor="kino-secure-form-value">
-                      Enter this value securely. It will not be added to chat or sent to the AI model.
-                    </label>
-                    <input
-                      id="kino-secure-form-value"
-                      type="password"
-                      value={secureValue}
-                      onChange={(event) => setSecureValue(event.target.value)}
-                      disabled={secureBusy}
-                      autoComplete="new-password"
-                      name="kino-secure-ephemeral-value"
-                      data-lpignore="true"
-                      data-1p-ignore="true"
-                      spellCheck={false}
-                      aria-label={`Secure ${secureRequest.fieldName} value`}
-                    />
-                    <div className="secure-entry-actions">
-                      <button
-                        type="submit"
-                        disabled={secureBusy || secureValue.length === 0}
-                      >
-                        {secureBusy ? "STAGING..." : "USE SECURELY"}
-                      </button>
-                      <button
-                        type="button"
-                        className="secure-cancel-button"
-                        onClick={cancelSecureRequest}
-                        disabled={secureBusy}
-                      >
-                        CANCEL
-                      </button>
-                    </div>
-                  </form>
-                ) : (
-                  <div className="secure-entry-staged">
-                    <span aria-hidden="true">✓</span>
-                    <p>
-                      Sensitive value received securely. Confirm in chat to fill this field.
-                    </p>
-                    <button
-                      type="button"
-                      className="secure-cancel-button"
-                      onClick={cancelSecureRequest}
-                      disabled={secureBusy}
-                    >
-                      CANCEL
-                    </button>
-                  </div>
-                )}
-
-                {secureError && (
-                  <p className="secure-entry-error" role="alert">{secureError}</p>
-                )}
-                <small>Expires shortly. The form will not be submitted.</small>
-              </div>
+                <label htmlFor="kino-login-username">
+                  {loginChallenge.usernameLabel || "Username / Email"}
+                </label>
+                <input
+                  id="kino-login-username"
+                  type="text"
+                  value={loginUsername}
+                  onChange={(event) => setLoginUsername(event.target.value)}
+                  autoComplete="username"
+                  disabled={loginBusy}
+                />
+                <label htmlFor="kino-login-password">
+                  {loginChallenge.passwordLabel || "Password"}
+                </label>
+                <input
+                  id="kino-login-password"
+                  type="password"
+                  value={loginPassword}
+                  onChange={(event) => setLoginPassword(event.target.value)}
+                  autoComplete="current-password"
+                  disabled={loginBusy}
+                />
+                <button type="submit" disabled={loginBusy || !loginUsername || !loginPassword}>
+                  {loginBusy ? "SIGNING IN..." : "LOGIN SECURELY"}
+                </button>
+                {loginError && <p className="secure-login-error" role="alert">{loginError}</p>}
+                <small>Values go only to the trusted browser worker and are discarded after use.</small>
+              </form>
             </div>
           )}
 
@@ -911,7 +798,7 @@ export default function Home() {
             </span>
 
             <span className="command-status">
-              LOCAL AI · NO CLOUD API
+              PRIVATE WORKER · SECURE SESSION
             </span>
           </div>
 
@@ -933,20 +820,16 @@ export default function Home() {
                   : kinoState ===
                       "responding"
                     ? "KINO is responding..."
-                    : awaitingSecureValue
-                      ? `Use the secure ${secureRequest?.fieldName ?? "value"} field above...`
-                      : "Message KINO..."
+                    : "Message KINO..."
               }
-              disabled={isBusy || awaitingSecureValue}
+              disabled={isBusy}
               autoComplete="off"
             />
 
             <button
               type="submit"
               disabled={
-                isBusy ||
-                awaitingSecureValue ||
-                !input.trim()
+                isBusy || !input.trim()
               }
             >
               {isBusy ? (
@@ -964,11 +847,9 @@ export default function Home() {
           </div>
 
           <p className="command-hint">
-            KINO can analyze
-            operational data,
-            customers, sales and
-            connected business
-            systems.
+            Give KINO any public website URL.
+            It observes visible controls and acts
+            through a private browser worker.
           </p>
         </form>
       </section>

@@ -13,9 +13,8 @@ import { createManualToolContext } from "./execution-context";
   This Map contains every capability that
   connected applications provide to KINO.
 
-  KINO itself does NOT need to know whether
-  the tool belongs to CleanNest, StoreFlow,
-  or another application.
+    KINO itself does NOT need website-specific
+    knowledge to use a generic capability.
 */
 
 const tools = new Map<

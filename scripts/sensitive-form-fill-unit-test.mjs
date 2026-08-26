@@ -251,11 +251,12 @@ clearEphemeralSensitiveStateForTests();
 assert.deepEqual(getSensitiveFormFillRuntimeSummary(restartConversation, now), { exists: false });
 
 const toolSource = readFileSync("lib/kino/tools/web-agent.ts", "utf8");
-const executionDefinition = toolSource.slice(
-  toolSource.indexOf('name: "web_execute_sensitive_form_fill"'),
-  toolSource.indexOf('name: "web_cancel_sensitive_form_fill"'),
-);
-assert.match(executionDefinition, /parameters:\s*\{ type: "object", properties: \{\} \}/);
-assert.doesNotMatch(executionDefinition, /properties:\s*\{[^}]*value/i);
+assert.doesNotMatch(toolSource, /web_execute_sensitive_form_fill/);
+assert.doesNotMatch(toolSource, /username|password/);
+const loginRouteSource = readFileSync("app/api/kino/browser-login/route.ts", "utf8");
+assert.match(loginRouteSource, /delete payload\.username/);
+assert.match(loginRouteSource, /delete payload\.password/);
+assert.match(loginRouteSource, /username = ""/);
+assert.match(loginRouteSource, /password = ""/);
 
 console.log("Sensitive form-fill unit tests passed.");

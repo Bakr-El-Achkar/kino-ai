@@ -3,7 +3,7 @@ import {
   executeKinoTool,
   getOllamaTools,
 } from "@/lib/kino/tools";
-import { getWebAgentRuntimeStateMessage } from "@/lib/kino/web-agent";
+import { browserRuntimeStateMessage } from "@/lib/kino/browser-worker/routing";
 
 export const runtime = "nodejs";
 
@@ -117,9 +117,7 @@ export async function POST(
     const messages: AgentMessage[] = [
       {
         role: "system",
-        content: await getWebAgentRuntimeStateMessage(
-          toolContext.conversationId,
-        ),
+        content: browserRuntimeStateMessage(),
       },
       {
         role: "user",
@@ -173,9 +171,7 @@ export async function POST(
     ) {
       messages[0] = {
         role: "system",
-        content: await getWebAgentRuntimeStateMessage(
-          toolContext.conversationId,
-        ),
+        content: browserRuntimeStateMessage(),
       };
 
       console.log(
