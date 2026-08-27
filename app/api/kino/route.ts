@@ -2,6 +2,7 @@ import { observeBrowser, openBrowserUrl } from "@/lib/kino/browser-worker/client
 import { formatBrowserToolResponse, unwrapToolResult } from "@/lib/kino/browser-worker/response";
 import { browserRuntimeStateMessage, requestedBrowserUrl } from "@/lib/kino/browser-worker/routing";
 import { shouldContinueSafeBrowserNarration } from "@/lib/kino/browser-worker/continuation";
+import { safeErrorDiagnostics, type AgentPhase, withTransientAiTransportRetry } from "@/lib/kino/ollama/transport-retry";
 import {
   createChatToolContext,
   executeKinoTool,
@@ -27,6 +28,7 @@ type OllamaResponse = {
   message?: { content?: string; thinking?: string; tool_calls?: ToolCall[] };
   error?: string;
 };
+type AiTransportStage = "NOT_STARTED" | "FETCHING_HEADERS" | "READING_BODY" | "VALIDATING_RESPONSE";
 
 const KINO_SYSTEM_PROMPT = `
 You are KINO, the Knowledge-Integrated Neural Operator, developed by Bakr El Achkar. You are a general AI web operator, not a chatbot with website-specific workflows.
@@ -80,7 +82,14 @@ function browserStopResponse(toolResult: unknown) {
   return null;
 }
 
-async function callOllama(messages: AgentMessage[], tools: ReturnType<typeof getOllamaTools>, deepMode: boolean, signal: AbortSignal) {
+async function callOllama(
+  messages: AgentMessage[],
+  tools: ReturnType<typeof getOllamaTools>,
+  deepMode: boolean,
+  signal: AbortSignal,
+  onStage: (stage: AiTransportStage) => void,
+) {
+  onStage("FETCHING_HEADERS");
   const response = await fetch(`${OLLAMA_HOST}/api/chat`, {
     method: "POST",
     headers: {
@@ -99,13 +108,24 @@ async function callOllama(messages: AgentMessage[], tools: ReturnType<typeof get
     signal,
   });
   if (!response.ok) throw new Error(`Ollama returned HTTP ${response.status}.`);
+  onStage("READING_BODY");
   const result = (await response.json()) as OllamaResponse;
-  if (result.error) throw new Error(result.error);
+  onStage("VALIDATING_RESPONSE");
+  if (result.error) {
+    const applicationError = new Error(result.error);
+    applicationError.name = "OllamaApplicationError";
+    throw applicationError;
+  }
   if (!result.message) throw new Error("Ollama returned no assistant message.");
   return result.message;
 }
 
 export async function POST(request: Request) {
+  const requestStartedAt = Date.now();
+  let agentPhase: AgentPhase = "INITIAL_REASONING";
+  let agentStep = 0;
+  let browserActionCompleted = false;
+  let aiTransportStage: AiTransportStage = "NOT_STARTED";
   try {
     const body = (await request.json()) as Record<string, unknown>;
     const incoming = body.messages;
@@ -138,17 +158,36 @@ export async function POST(request: Request) {
       ...messages.map((message) => ({ role: message.role, content: message.content } as AgentMessage)),
     ];
     const tools = getOllamaTools();
-    const startedAt = Date.now();
+    const startedAt = requestStartedAt;
     const duplicateActions = new Map<string, number>();
     const actionHistory: string[] = [];
     let narrationContinuations = 0;
 
     for (let round = 1; round <= MAX_BROWSER_STEPS; round += 1) {
+      agentStep = round;
+      agentPhase = round === 1 ? "INITIAL_REASONING" : "CONTINUATION";
       if (Date.now() - startedAt > MAX_RUNTIME_MS) return plain("KINO stopped because the browser-operation runtime limit was reached.");
-      const assistant = await callOllama(agentMessages, tools, body.think === true, request.signal);
+      const assistant = await withTransientAiTransportRetry(
+        () => callOllama(agentMessages, tools, body.think === true, request.signal, (stage) => { aiTransportStage = stage; }),
+        {
+          signal: request.signal,
+          startedAt,
+          maxRuntimeMs: MAX_RUNTIME_MS,
+          onRetry: (error, retryAttempt) => console.warn("KINO_AI_TRANSPORT_RETRY", {
+            ...safeErrorDiagnostics(error),
+            agentPhase,
+            agentStep,
+            browserActionCompleted,
+            aiTransportStage,
+            elapsedMs: Date.now() - startedAt,
+            retryAttempt,
+          }),
+        },
+      );
       const toolCalls = assistant.tool_calls ?? [];
       agentMessages.push({ role: "assistant", content: assistant.content ?? "", thinking: assistant.thinking, tool_calls: toolCalls.length ? toolCalls : undefined });
       if (!toolCalls.length) {
+        agentPhase = "FINAL_SYNTHESIS";
         const content = assistant.content?.trim() ?? "";
         if (shouldContinueSafeBrowserNarration(latestMessage, content, narrationContinuations)) {
           narrationContinuations += 1;
@@ -163,6 +202,7 @@ export async function POST(request: Request) {
 
       // One tool step per round preserves observe → reason → act ordering.
       for (const call of toolCalls.slice(0, 1)) {
+        agentPhase = "TOOL_EXECUTION";
         const toolName = call.function.name;
         const args = call.function.arguments ?? {};
         if (toolName.startsWith("web_")) {
@@ -186,6 +226,9 @@ export async function POST(request: Request) {
         }
         agentMessages.push({ role: "tool", tool_name: toolName, content: JSON.stringify(result) });
         const unwrapped = unwrapToolResult(result);
+        if (toolName.startsWith("web_") && ["OPENED", "ACTION_COMPLETED", "AUTH_SUCCESS"].includes(String(unwrapped?.status ?? ""))) {
+          browserActionCompleted = true;
+        }
         const recoveryStatus = typeof unwrapped?.status === "string" ? unwrapped.status : "";
         if (toolName === "web_action" && ["STALE_ELEMENT", "NAVIGATION_UNVERIFIED"].includes(recoveryStatus)) {
           const refreshed = await executeKinoTool("web_observe", {}, context).catch(() => null);
@@ -198,7 +241,14 @@ export async function POST(request: Request) {
     return plain(`KINO reached the configured maximum of ${MAX_BROWSER_STEPS} browser steps without completing the goal.`);
   } catch (error) {
     if (error instanceof Error && error.name === "AbortError") return plain("KINO request cancelled.", 499);
-    console.error("KINO API Error:", error instanceof Error ? error.message : "Unknown error");
+    console.error("KINO_API_ERROR", {
+      ...safeErrorDiagnostics(error),
+      agentPhase,
+      agentStep,
+      browserActionCompleted,
+      aiTransportStage,
+      elapsedMs: Date.now() - requestStartedAt,
+    });
     return Response.json({ error: "Unable to communicate with KINO." }, { status: 500 });
   }
 }

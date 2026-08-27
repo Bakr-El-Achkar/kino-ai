@@ -9,11 +9,75 @@ import { observePage } from "../browser-worker/observer.ts";
 import { developmentPrivateNetworkEscapeEnabled, isPrivateAddress, routedRequestProtocolPolicy, validatePublicUrl } from "../browser-worker/url-security.ts";
 import { requestedBrowserUrl } from "../lib/kino/browser-worker/routing.ts";
 import { shouldContinueSafeBrowserNarration } from "../lib/kino/browser-worker/continuation.ts";
+import { isTransientAiTransportError, safeErrorDiagnostics, withTransientAiTransportRetry } from "../lib/kino/ollama/transport-retry.ts";
 import { formatBrowserToolResponse } from "../lib/kino/browser-worker/response.ts";
 import { buildCriticalConfirmationPhrase, parseActionConfirmation } from "../lib/kino/web-agent/action-confirmation.ts";
 
 const publicLookup = async () => [{ address: "93.184.216.34", family: 4 }];
 const privateLookup = async () => [{ address: "10.0.0.5", family: 4 }];
+
+const retrySignal = new AbortController().signal;
+const retryOptions = () => ({ signal: retrySignal, startedAt: Date.now(), maxRuntimeMs: 10_000, backoffMs: 0 });
+let normalModelCalls = 0;
+assert.equal(await withTransientAiTransportRetry(async () => {
+  normalModelCalls += 1;
+  return "normal-model-response";
+}, retryOptions()), "normal-model-response");
+assert.equal(normalModelCalls, 1);
+
+let continuationModelCalls = 0;
+const completedToolTranscript = [{ role: "tool", content: JSON.stringify({ status: "ACTION_COMPLETED" }) }];
+const completedBrowserActions = 1;
+const recoveredContinuation = await withTransientAiTransportRetry(async () => {
+  continuationModelCalls += 1;
+  assert.equal(completedToolTranscript.length, 1);
+  if (continuationModelCalls === 1) throw new Error("terminated");
+  return "final synthesis recovered";
+}, retryOptions());
+assert.equal(recoveredContinuation, "final synthesis recovered");
+assert.equal(continuationModelCalls, 2);
+assert.equal(completedBrowserActions, 1);
+
+const writeExecutions = 1;
+let writeSynthesisCalls = 0;
+assert.equal(await withTransientAiTransportRetry(async () => {
+  writeSynthesisCalls += 1;
+  if (writeSynthesisCalls === 1) throw new Error("socket closed");
+  return "write result summarized";
+}, retryOptions()), "write result summarized");
+assert.equal(writeExecutions, 1);
+assert.equal(writeSynthesisCalls, 2);
+
+let repeatedFailures = 0;
+await assert.rejects(withTransientAiTransportRetry(async () => {
+  repeatedFailures += 1;
+  throw new Error("terminated");
+}, retryOptions()), /terminated/);
+assert.equal(repeatedFailures, 2);
+
+let expiredRuntimeCalls = 0;
+await assert.rejects(withTransientAiTransportRetry(async () => {
+  expiredRuntimeCalls += 1;
+  throw new Error("terminated");
+}, { signal: retrySignal, startedAt: Date.now() - 10_000, maxRuntimeMs: 10_000, backoffMs: 0 }), /terminated/);
+assert.equal(expiredRuntimeCalls, 1);
+
+let authenticationCalls = 0;
+await assert.rejects(withTransientAiTransportRetry(async () => {
+  authenticationCalls += 1;
+  throw new Error("Ollama returned HTTP 401.");
+}, retryOptions()), /HTTP 401/);
+assert.equal(authenticationCalls, 1);
+assert.equal(isTransientAiTransportError(new Error("WORKER_UNAVAILABLE")), false);
+assert.equal(isTransientAiTransportError(new DOMException("cancelled", "AbortError")), false);
+const ollamaApplicationError = new Error("terminated");
+ollamaApplicationError.name = "OllamaApplicationError";
+assert.equal(isTransientAiTransportError(ollamaApplicationError), false);
+const socketError = new TypeError("fetch failed", { cause: Object.assign(new Error("other side closed"), { code: "UND_ERR_SOCKET" }) });
+assert.equal(isTransientAiTransportError(socketError), true);
+assert.deepEqual(Object.keys(safeErrorDiagnostics(socketError)), ["errorName", "errorMessage", "causeName", "causeMessage", "causeCode"]);
+const redactedDiagnostics = safeErrorDiagnostics(new Error("failed at https://private.example/path with Bearer secret-value"));
+assert.doesNotMatch(JSON.stringify(redactedDiagnostics), /private\.example|secret-value/);
 
 const publicUrl = await validatePublicUrl("https://example.com/path", { lookup: publicLookup });
 assert.equal(publicUrl.allowed, true);
@@ -423,6 +487,14 @@ assert.match(controllerSource, /MAX_BROWSER_STEPS/);
 assert.match(controllerSource, /duplicateActions/);
 assert.match(controllerSource, /actionHistory/);
 assert.match(controllerSource, /toolCalls\.slice\(0, 1\)/);
+assert.match(controllerSource, /withTransientAiTransportRetry/);
+assert.match(controllerSource, /KINO_AI_TRANSPORT_RETRY/);
+assert.match(controllerSource, /KINO_API_ERROR/);
+const modelRetrySection = controllerSource.slice(
+  controllerSource.indexOf("const assistant = await withTransientAiTransportRetry"),
+  controllerSource.indexOf("const toolCalls = assistant.tool_calls"),
+);
+assert.doesNotMatch(modelRetrySection, /executeKinoTool|web_action|web_open_url/);
 const toolsIndexSource = readFileSync("lib/kino/tools/index.ts", "utf8");
 assert.doesNotMatch(toolsIndexSource, /playwright|browser-manager/);
 
