@@ -91,6 +91,7 @@ async function callOllama(
   onStage: (stage: AiTransportStage) => void,
   onHttpError: (diagnostics: Awaited<ReturnType<typeof ollamaHttpErrorDiagnostics>>) => void,
 ) {
+  const requestOptions = { num_ctx: 8192, num_predict: 1024 };
   const serializedRequest = JSON.stringify({
     model: OLLAMA_MODEL,
     messages,
@@ -98,7 +99,7 @@ async function callOllama(
     stream: false,
     think: deepMode,
     keep_alive: -1,
-    options: { num_ctx: 8192, num_predict: 1024 },
+    options: requestOptions,
   });
   onStage("FETCHING_HEADERS");
   const response = await fetch(`${OLLAMA_HOST}/api/chat`, {
@@ -116,6 +117,7 @@ async function callOllama(
       serializedRequest,
       messages,
       toolDefinitionCount: tools.length,
+      requestOptions,
       secrets: OLLAMA_API_KEY ? [OLLAMA_API_KEY] : [],
     });
     onHttpError(diagnostics);

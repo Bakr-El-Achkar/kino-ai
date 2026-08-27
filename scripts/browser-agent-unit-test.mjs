@@ -80,21 +80,67 @@ assert.deepEqual(Object.keys(safeErrorDiagnostics(socketError)), ["errorName", "
 const redactedDiagnostics = safeErrorDiagnostics(new Error("failed at https://private.example/path with Bearer secret-value"));
 assert.doesNotMatch(JSON.stringify(redactedDiagnostics), /private\.example|secret-value/);
 
-const diagnosticRequest = JSON.stringify({ messages: [{ role: "user", content: "diagnostic request" }], tools: [{ type: "function" }] });
+const actualDiagnosticRequestOptions = { num_ctx: 8192, num_predict: 1024 };
+const diagnosticRequest = JSON.stringify({
+  messages: [{ role: "user", content: "diagnostic request" }],
+  tools: [{ type: "function" }],
+  options: actualDiagnosticRequestOptions,
+});
 const jsonHttpDiagnostics = await ollamaHttpErrorDiagnostics(new Response(
-  JSON.stringify({ error: "model runner unexpectedly stopped", ignored: "must not be copied" }),
+  JSON.stringify({ error: "plain failure", ignored: "must not be copied" }),
   { status: 500, statusText: "Internal Server Error", headers: { "Content-Type": "application/json" } },
 ), {
   serializedRequest: diagnosticRequest,
   messages: [{ content: "diagnostic request" }],
   toolDefinitionCount: 1,
+  requestOptions: actualDiagnosticRequestOptions,
 });
 assert.equal(jsonHttpDiagnostics.upstreamStatus, 500);
-assert.equal(jsonHttpDiagnostics.ollamaError, "model runner unexpectedly stopped");
+assert.equal(jsonHttpDiagnostics.ollamaError, "plain failure");
 assert.equal(jsonHttpDiagnostics.messageCount, 1);
 assert.equal(jsonHttpDiagnostics.toolDefinitionCount, 1);
 assert.equal(jsonHttpDiagnostics.messageContentCharacters, "diagnostic request".length);
+assert.equal(jsonHttpDiagnostics.configuredNumCtx, actualDiagnosticRequestOptions.num_ctx);
+assert.equal(jsonHttpDiagnostics.configuredNumPredict, actualDiagnosticRequestOptions.num_predict);
 assert.doesNotMatch(JSON.stringify(jsonHttpDiagnostics), /must not be copied/);
+
+const objectHttpDiagnostics = await ollamaHttpErrorDiagnostics(new Response(JSON.stringify({ error: {
+  message: "context exceeded",
+  code: "MODEL_CONTEXT_LIMIT",
+  type: "runner_error",
+  status: false,
+  status_code: 500,
+  reason: "input too large",
+  unknown: "UNKNOWN_FIELD_MUST_NOT_APPEAR",
+  details: { private: "NESTED_PRIVATE_VALUE" },
+} }), { status: 500, headers: { "Content-Type": "application/json" } }), {
+  serializedRequest: diagnosticRequest,
+  messages: [{ content: "diagnostic request" }],
+  toolDefinitionCount: 1,
+  requestOptions: actualDiagnosticRequestOptions,
+});
+assert.equal(objectHttpDiagnostics.ollamaError, undefined);
+assert.equal(objectHttpDiagnostics.ollamaErrorMessage, "context exceeded");
+assert.equal(objectHttpDiagnostics.ollamaErrorCode, "MODEL_CONTEXT_LIMIT");
+assert.equal(objectHttpDiagnostics.ollamaErrorType, "runner_error");
+assert.equal(objectHttpDiagnostics.ollamaErrorStatus, false);
+assert.equal(objectHttpDiagnostics.ollamaErrorStatusCode, 500);
+assert.equal(objectHttpDiagnostics.ollamaErrorReason, "input too large");
+assert.doesNotMatch(JSON.stringify(objectHttpDiagnostics), /UNKNOWN_FIELD_MUST_NOT_APPEAR|NESTED_PRIVATE_VALUE|unknown|details/);
+
+const ignoredNestedScalars = await ollamaHttpErrorDiagnostics(new Response(JSON.stringify({ error: {
+  message: { text: "hidden nested message" },
+  code: ["hidden array code"],
+  type: null,
+} }), { status: 500, headers: { "Content-Type": "application/json" } }), {
+  serializedRequest: "{}",
+  messages: [],
+  toolDefinitionCount: 0,
+});
+assert.equal(ignoredNestedScalars.ollamaErrorMessage, undefined);
+assert.equal(ignoredNestedScalars.ollamaErrorCode, undefined);
+assert.equal(ignoredNestedScalars.ollamaErrorType, undefined);
+assert.doesNotMatch(JSON.stringify(ignoredNestedScalars), /hidden nested message|hidden array code/);
 
 const rawPrivateBody = "RAW_NON_JSON_PRIVATE_BODY";
 const nonJsonHttpDiagnostics = await ollamaHttpErrorDiagnostics(new Response(rawPrivateBody, {
@@ -107,7 +153,10 @@ assert.doesNotMatch(JSON.stringify(nonJsonHttpDiagnostics), new RegExp(rawPrivat
 const privatePrompt = "PRIVATE_PROMPT_CONTENT_12345";
 const privateAuthorization = "private-authorization-token-67890";
 const privateErrorDiagnostics = await ollamaHttpErrorDiagnostics(new Response(JSON.stringify({
-  error: `runner failed for ${privatePrompt} using Bearer ${privateAuthorization}`,
+  error: {
+    message: `runner failed for ${privatePrompt}`,
+    code: `Bearer ${privateAuthorization}`,
+  },
 }), { status: 500, headers: { "Content-Type": "application/problem+json" } }), {
   serializedRequest: JSON.stringify({ messages: [{ content: privatePrompt }] }),
   messages: [{ content: privatePrompt }],
@@ -121,6 +170,16 @@ const longErrorDiagnostics = await ollamaHttpErrorDiagnostics(new Response(JSON.
   headers: { "Content-Type": "application/json" },
 }), { serializedRequest: "{}", messages: [], toolDefinitionCount: 0 });
 assert.ok(longErrorDiagnostics.ollamaError && longErrorDiagnostics.ollamaError.length <= 500);
+const longObjectErrorDiagnostics = await ollamaHttpErrorDiagnostics(new Response(JSON.stringify({ error: {
+  message: "m".repeat(900),
+  reason: "r".repeat(900),
+} }), { status: 500, headers: { "Content-Type": "application/json" } }), {
+  serializedRequest: "{}",
+  messages: [],
+  toolDefinitionCount: 0,
+});
+assert.ok(typeof longObjectErrorDiagnostics.ollamaErrorMessage === "string" && longObjectErrorDiagnostics.ollamaErrorMessage.length <= 500);
+assert.ok(typeof longObjectErrorDiagnostics.ollamaErrorReason === "string" && longObjectErrorDiagnostics.ollamaErrorReason.length <= 500);
 assert.equal(ollamaRequestDiagnostics("é", [], 0).requestBytes, 2);
 
 let http500Calls = 0;
