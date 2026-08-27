@@ -9,6 +9,7 @@ import { observePage } from "../browser-worker/observer.ts";
 import { developmentPrivateNetworkEscapeEnabled, isPrivateAddress, routedRequestProtocolPolicy, validatePublicUrl } from "../browser-worker/url-security.ts";
 import { requestedBrowserUrl } from "../lib/kino/browser-worker/routing.ts";
 import { shouldContinueSafeBrowserNarration } from "../lib/kino/browser-worker/continuation.ts";
+import { ollamaHttpErrorDiagnostics, ollamaRequestDiagnostics } from "../lib/kino/ollama/http-error-diagnostics.ts";
 import { isTransientAiTransportError, safeErrorDiagnostics, withTransientAiTransportRetry } from "../lib/kino/ollama/transport-retry.ts";
 import { formatBrowserToolResponse } from "../lib/kino/browser-worker/response.ts";
 import { buildCriticalConfirmationPhrase, parseActionConfirmation } from "../lib/kino/web-agent/action-confirmation.ts";
@@ -78,6 +79,58 @@ assert.equal(isTransientAiTransportError(socketError), true);
 assert.deepEqual(Object.keys(safeErrorDiagnostics(socketError)), ["errorName", "errorMessage", "causeName", "causeMessage", "causeCode"]);
 const redactedDiagnostics = safeErrorDiagnostics(new Error("failed at https://private.example/path with Bearer secret-value"));
 assert.doesNotMatch(JSON.stringify(redactedDiagnostics), /private\.example|secret-value/);
+
+const diagnosticRequest = JSON.stringify({ messages: [{ role: "user", content: "diagnostic request" }], tools: [{ type: "function" }] });
+const jsonHttpDiagnostics = await ollamaHttpErrorDiagnostics(new Response(
+  JSON.stringify({ error: "model runner unexpectedly stopped", ignored: "must not be copied" }),
+  { status: 500, statusText: "Internal Server Error", headers: { "Content-Type": "application/json" } },
+), {
+  serializedRequest: diagnosticRequest,
+  messages: [{ content: "diagnostic request" }],
+  toolDefinitionCount: 1,
+});
+assert.equal(jsonHttpDiagnostics.upstreamStatus, 500);
+assert.equal(jsonHttpDiagnostics.ollamaError, "model runner unexpectedly stopped");
+assert.equal(jsonHttpDiagnostics.messageCount, 1);
+assert.equal(jsonHttpDiagnostics.toolDefinitionCount, 1);
+assert.equal(jsonHttpDiagnostics.messageContentCharacters, "diagnostic request".length);
+assert.doesNotMatch(JSON.stringify(jsonHttpDiagnostics), /must not be copied/);
+
+const rawPrivateBody = "RAW_NON_JSON_PRIVATE_BODY";
+const nonJsonHttpDiagnostics = await ollamaHttpErrorDiagnostics(new Response(rawPrivateBody, {
+  status: 500,
+  headers: { "Content-Type": "text/plain" },
+}), { serializedRequest: "{}", messages: [], toolDefinitionCount: 0 });
+assert.equal(nonJsonHttpDiagnostics.ollamaError, undefined);
+assert.doesNotMatch(JSON.stringify(nonJsonHttpDiagnostics), new RegExp(rawPrivateBody));
+
+const privatePrompt = "PRIVATE_PROMPT_CONTENT_12345";
+const privateAuthorization = "private-authorization-token-67890";
+const privateErrorDiagnostics = await ollamaHttpErrorDiagnostics(new Response(JSON.stringify({
+  error: `runner failed for ${privatePrompt} using Bearer ${privateAuthorization}`,
+}), { status: 500, headers: { "Content-Type": "application/problem+json" } }), {
+  serializedRequest: JSON.stringify({ messages: [{ content: privatePrompt }] }),
+  messages: [{ content: privatePrompt }],
+  toolDefinitionCount: 0,
+  secrets: [privateAuthorization],
+});
+assert.doesNotMatch(JSON.stringify(privateErrorDiagnostics), new RegExp(`${privatePrompt}|${privateAuthorization}`));
+
+const longErrorDiagnostics = await ollamaHttpErrorDiagnostics(new Response(JSON.stringify({ error: "x".repeat(900) }), {
+  status: 500,
+  headers: { "Content-Type": "application/json" },
+}), { serializedRequest: "{}", messages: [], toolDefinitionCount: 0 });
+assert.ok(longErrorDiagnostics.ollamaError && longErrorDiagnostics.ollamaError.length <= 500);
+assert.equal(ollamaRequestDiagnostics("é", [], 0).requestBytes, 2);
+
+let http500Calls = 0;
+const deterministicHttp500 = new Error("Ollama returned HTTP 500.");
+deterministicHttp500.name = "OllamaHttpError";
+await assert.rejects(withTransientAiTransportRetry(async () => {
+  http500Calls += 1;
+  throw deterministicHttp500;
+}, retryOptions()), /HTTP 500/);
+assert.equal(http500Calls, 1);
 
 const publicUrl = await validatePublicUrl("https://example.com/path", { lookup: publicLookup });
 assert.equal(publicUrl.allowed, true);
@@ -490,6 +543,9 @@ assert.match(controllerSource, /toolCalls\.slice\(0, 1\)/);
 assert.match(controllerSource, /withTransientAiTransportRetry/);
 assert.match(controllerSource, /KINO_AI_TRANSPORT_RETRY/);
 assert.match(controllerSource, /KINO_API_ERROR/);
+assert.match(controllerSource, /KINO_OLLAMA_HTTP_ERROR/);
+assert.match(controllerSource, /OllamaHttpError/);
+assert.doesNotMatch(controllerSource, /console\.(?:log|warn|error)\([^\n]*(?:messages|serializedRequest|OLLAMA_API_KEY)/);
 const modelRetrySection = controllerSource.slice(
   controllerSource.indexOf("const assistant = await withTransientAiTransportRetry"),
   controllerSource.indexOf("const toolCalls = assistant.tool_calls"),

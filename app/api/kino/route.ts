@@ -3,6 +3,7 @@ import { formatBrowserToolResponse, unwrapToolResult } from "@/lib/kino/browser-
 import { browserRuntimeStateMessage, requestedBrowserUrl } from "@/lib/kino/browser-worker/routing";
 import { shouldContinueSafeBrowserNarration } from "@/lib/kino/browser-worker/continuation";
 import { safeErrorDiagnostics, type AgentPhase, withTransientAiTransportRetry } from "@/lib/kino/ollama/transport-retry";
+import { ollamaHttpErrorDiagnostics } from "@/lib/kino/ollama/http-error-diagnostics";
 import {
   createChatToolContext,
   executeKinoTool,
@@ -28,7 +29,7 @@ type OllamaResponse = {
   message?: { content?: string; thinking?: string; tool_calls?: ToolCall[] };
   error?: string;
 };
-type AiTransportStage = "NOT_STARTED" | "FETCHING_HEADERS" | "READING_BODY" | "VALIDATING_RESPONSE";
+type AiTransportStage = "NOT_STARTED" | "FETCHING_HEADERS" | "READING_ERROR_BODY" | "READING_BODY" | "VALIDATING_RESPONSE";
 
 const KINO_SYSTEM_PROMPT = `
 You are KINO, the Knowledge-Integrated Neural Operator, developed by Bakr El Achkar. You are a general AI web operator, not a chatbot with website-specific workflows.
@@ -88,7 +89,17 @@ async function callOllama(
   deepMode: boolean,
   signal: AbortSignal,
   onStage: (stage: AiTransportStage) => void,
+  onHttpError: (diagnostics: Awaited<ReturnType<typeof ollamaHttpErrorDiagnostics>>) => void,
 ) {
+  const serializedRequest = JSON.stringify({
+    model: OLLAMA_MODEL,
+    messages,
+    tools,
+    stream: false,
+    think: deepMode,
+    keep_alive: -1,
+    options: { num_ctx: 8192, num_predict: 1024 },
+  });
   onStage("FETCHING_HEADERS");
   const response = await fetch(`${OLLAMA_HOST}/api/chat`, {
     method: "POST",
@@ -96,18 +107,22 @@ async function callOllama(
       "Content-Type": "application/json",
       ...(OLLAMA_API_KEY ? { Authorization: `Bearer ${OLLAMA_API_KEY}` } : {}),
     },
-    body: JSON.stringify({
-      model: OLLAMA_MODEL,
-      messages,
-      tools,
-      stream: false,
-      think: deepMode,
-      keep_alive: -1,
-      options: { num_ctx: 8192, num_predict: 1024 },
-    }),
+    body: serializedRequest,
     signal,
   });
-  if (!response.ok) throw new Error(`Ollama returned HTTP ${response.status}.`);
+  if (!response.ok) {
+    onStage("READING_ERROR_BODY");
+    const diagnostics = await ollamaHttpErrorDiagnostics(response, {
+      serializedRequest,
+      messages,
+      toolDefinitionCount: tools.length,
+      secrets: OLLAMA_API_KEY ? [OLLAMA_API_KEY] : [],
+    });
+    onHttpError(diagnostics);
+    const httpError = new Error(`Ollama returned HTTP ${response.status}.`);
+    httpError.name = "OllamaHttpError";
+    throw httpError;
+  }
   onStage("READING_BODY");
   const result = (await response.json()) as OllamaResponse;
   onStage("VALIDATING_RESPONSE");
@@ -167,8 +182,27 @@ export async function POST(request: Request) {
       agentStep = round;
       agentPhase = round === 1 ? "INITIAL_REASONING" : "CONTINUATION";
       if (Date.now() - startedAt > MAX_RUNTIME_MS) return plain("KINO stopped because the browser-operation runtime limit was reached.");
+      let aiRequestAttempt = 0;
       const assistant = await withTransientAiTransportRetry(
-        () => callOllama(agentMessages, tools, body.think === true, request.signal, (stage) => { aiTransportStage = stage; }),
+        () => {
+          const retryAttempt = aiRequestAttempt;
+          aiRequestAttempt += 1;
+          return callOllama(
+            agentMessages,
+            tools,
+            body.think === true,
+            request.signal,
+            (stage) => { aiTransportStage = stage; },
+            (diagnostics) => console.error("KINO_OLLAMA_HTTP_ERROR", {
+              ...diagnostics,
+              agentPhase,
+              agentStep,
+              browserActionCompleted,
+              elapsedMs: Date.now() - startedAt,
+              retryAttempt,
+            }),
+          );
+        },
         {
           signal: request.signal,
           startedAt,
