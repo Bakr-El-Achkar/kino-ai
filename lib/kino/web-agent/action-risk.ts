@@ -17,7 +17,7 @@ const CRITICAL_PATTERNS = [
 ];
 
 const WRITE_PATTERN =
-  /\b(?:add|create|edit|update|save|assign|reschedule|upload|send|submit|change\s+status|approve|reject|publish|invite|archive|restore|enable|confirm)\b/i;
+  /\b(?:add|create|edit|update|save|assign|reschedule|upload|send|submit|change\s+(?:status|settings?|password|email)|approve|reject|publish|invite|archive|restore|enable|confirm|checkout|purchase|buy\s+now|book\s+now|log\s*out)\b/i;
 
 const READ_PATTERN =
   /\b(?:open|view|show|search|filter|expand|collapse|previous|prev|next|sort|details?|dashboard|list|browse|go\s+to|navigate)\b/i;
@@ -28,19 +28,24 @@ export type ClassifyActionRiskInput = {
   destination?: WebActionDestination;
 };
 
+export function explicitExternalEffectRisk(name: string): Extract<WebActionRisk, "write" | "critical"> | null {
+  if (CRITICAL_PATTERNS.some((pattern) => pattern.test(name))) return "critical";
+  return WRITE_PATTERN.test(name) ? "write" : null;
+}
+
 export function classifyActionRisk({
   name,
   role,
   destination = "none",
 }: ClassifyActionRiskInput): { risk: WebActionRisk; reason: string } {
-  if (CRITICAL_PATTERNS.some((pattern) => pattern.test(name))) {
+  if (explicitExternalEffectRisk(name) === "critical") {
     return {
       risk: "critical",
       reason: "The control describes a destructive, security-sensitive, or financial action.",
     };
   }
 
-  if (WRITE_PATTERN.test(name)) {
+  if (explicitExternalEffectRisk(name) === "write") {
     return {
       risk: "write",
       reason: "The control likely creates or modifies application data.",

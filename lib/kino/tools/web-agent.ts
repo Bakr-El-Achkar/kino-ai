@@ -46,7 +46,7 @@ registerTool({
 registerTool({
   name: "web_action",
   description:
-    "Perform one generic browser step using ONLY a semantic element ID from the latest trusted observation. Supports click, ordinary-field fill, native select, check, uncheck, back, reload, and scroll. CSS/XPath selectors are never accepted. Write or critical clicks are prepared for confirmation instead of executed.",
+    "Perform one generic browser step using ONLY a semantic element ID from the latest trusted observation. Normal HTTP(S) links are READ_NAVIGATION and need no write confirmation. Downloads return DOWNLOAD_REQUIRES_HANDLING. Stale IDs return STALE_ELEMENT and must be replaced by a fresh observation. Supports click, ordinary-field fill, native select, check, uncheck, back, reload, and scroll. CSS/XPath selectors are never accepted. Write or critical clicks are prepared for confirmation instead of executed.",
   integration: "browser-worker",
   risk: "read",
   parameters: {

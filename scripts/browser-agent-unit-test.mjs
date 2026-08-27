@@ -8,6 +8,7 @@ import { chromium } from "playwright";
 import { observePage } from "../browser-worker/observer.ts";
 import { developmentPrivateNetworkEscapeEnabled, isPrivateAddress, routedRequestProtocolPolicy, validatePublicUrl } from "../browser-worker/url-security.ts";
 import { requestedBrowserUrl } from "../lib/kino/browser-worker/routing.ts";
+import { shouldContinueSafeBrowserNarration } from "../lib/kino/browser-worker/continuation.ts";
 import { formatBrowserToolResponse } from "../lib/kino/browser-worker/response.ts";
 import { buildCriticalConfirmationPhrase, parseActionConfirmation } from "../lib/kino/web-agent/action-confirmation.ts";
 
@@ -173,9 +174,28 @@ try {
 // Development-only loopback browsing proves openUrl has no connection-registry dependency.
 process.env.KINO_BROWSER_ALLOW_PRIVATE_NETWORKS = "true";
 const testServer = createServer((request, response) => {
-  response.writeHead(200, { "Content-Type": "text/html" });
+  response.writeHead(200, {
+    "Content-Type": "text/html",
+    ...(request.url === "/runtime-file" ? { "Content-Disposition": "attachment; filename=report.bin" } : {}),
+  });
   if (request.url === "/next") {
     response.end("<title>Next area</title><h1>Semantic navigation completed</h1>");
+  } else if (request.url === "/alpha") {
+    response.end("<title>Alpha target</title><h1>Correct alpha destination</h1>");
+  } else if (request.url === "/beta") {
+    response.end("<title>Beta target</title><h1>Wrong beta destination</h1>");
+  } else if (request.url === "/blocked-navigation") {
+    response.end(`<title>Blocked navigation test</title><a href="/alpha" onclick="event.preventDefault()">Open Alpha</a>`);
+  } else if (request.url === "/downloads") {
+    response.end(`<title>Downloads</title><a download href="/archive.bin">Download archive</a><a href="/runtime-file">Get report</a>`);
+  } else if (request.url === "/archive.bin") {
+    response.end("not downloaded");
+  } else if (request.url === "/runtime-file") {
+    response.end("not retained");
+  } else if (request.url === "/reorder-move") {
+    response.end(`<title>Move controls</title><div id="links"><a id="alpha" href="/alpha">Alpha game</a><a id="beta" href="/beta">Beta game</a></div><script>setTimeout(()=>document.getElementById('links').append(document.getElementById('alpha')),750)</script>`);
+  } else if (request.url === "/reorder-replace") {
+    response.end(`<title>Replace controls</title><div id="links"><a id="alpha" href="/alpha">Alpha game</a><a href="/beta">Beta game</a></div><script>setTimeout(()=>document.getElementById('alpha').outerHTML='<a href="/beta">Alpha game</a>',750)</script>`);
   } else if (request.url === "/dynamic-write") {
     response.end(`<title>Dynamic write</title><h1>Customer editor</h1><p id="clock">Before</p><button type="submit" onclick="document.getElementById('clock').textContent='Unrelated dynamic text '+Date.now()">Save Customer</button>`);
   } else if (request.url === "/login") {
@@ -187,6 +207,7 @@ const testServer = createServer((request, response) => {
       <a href="data:text/html,unsafe">Unsafe data</a>
       <a href="file:///etc/passwd">Unsafe file</a>
       <a href="ftp://example.com/resource">Unsafe FTP</a>
+      <a href="/alpha">Delete account</a>
       <label><input type="checkbox"> Receive updates</label>
       <button id="save" type="submit" onclick="document.body.innerHTML='<h1>Customer saved</h1>'">Save Customer</button>
       <button onclick="document.getElementById('save').outerHTML='<button id=&quot;save&quot; type=&quot;button&quot;>Changed Customer Control</button>'">View replacement</button>
@@ -255,7 +276,7 @@ const replacementTrigger = replacementOpen.observation?.elements.find((element) 
 assert.ok(replacementSave && replacementTrigger);
 assert.equal((await performAction(arbitrarySessionId, { action: "click", elementId: replacementSave.id })).status, "ACTION_NEEDS_CONFIRMATION");
 assert.equal((await performAction(arbitrarySessionId, { action: "click", elementId: replacementTrigger.id })).status, "ACTION_COMPLETED");
-assert.equal((await performAction(arbitrarySessionId, { action: "confirm_pending", confirmation: "yes" })).status, "PAGE_CHANGED");
+assert.equal((await performAction(arbitrarySessionId, { action: "confirm_pending", confirmation: "yes" })).status, "STALE_ELEMENT");
 
 const dynamicOpen = await openUrl(arbitrarySessionId, `http://127.0.0.1:${address.port}/dynamic-write`);
 const dynamicSave = dynamicOpen.observation?.elements.find((element) => element.name === "Save Customer");
@@ -266,6 +287,76 @@ assert.equal(unverifiedWrite.status, "ACTION_UNVERIFIED");
 assert.equal(unverifiedWrite.effectVerified, false);
 assert.match(formatBrowserToolResponse(unverifiedWrite), /activated, but completion could not be strongly verified/i);
 assert.doesNotMatch(formatBrowserToolResponse(unverifiedWrite), /saved|submitted|updated|deleted|sent|refunded/i);
+
+// Normal links are explicit read navigation, while failed verification remains read-specific.
+const blockedNavigationOpen = await openUrl(arbitrarySessionId, `http://127.0.0.1:${address.port}/blocked-navigation`);
+const blockedNavigationLink = blockedNavigationOpen.observation?.elements.find((element) => element.name === "Open Alpha");
+assert.ok(blockedNavigationLink);
+const blockedNavigation = await performAction(arbitrarySessionId, { action: "click", elementId: blockedNavigationLink.id });
+assert.equal(blockedNavigation.status, "NAVIGATION_UNVERIFIED");
+assert.equal(blockedNavigation.pendingAction, undefined);
+assert.equal(blockedNavigation.effectVerified, false);
+
+// Known and runtime-discovered downloads are never saved or treated as ordinary navigation.
+const downloadOpen = await openUrl(arbitrarySessionId, `http://127.0.0.1:${address.port}/downloads`);
+const declaredDownload = downloadOpen.observation?.elements.find((element) => element.name === "Download archive");
+const runtimeDownload = downloadOpen.observation?.elements.find((element) => element.name === "Get report");
+assert.ok(declaredDownload && runtimeDownload);
+assert.equal((await performAction(arbitrarySessionId, { action: "click", elementId: declaredDownload.id })).status, "DOWNLOAD_REQUIRES_HANDLING");
+const runtimeDownloadResult = await performAction(arbitrarySessionId, { action: "click", elementId: runtimeDownload.id });
+assert.equal(runtimeDownloadResult.status, "DOWNLOAD_REQUIRES_HANDLING");
+assert.equal(runtimeDownloadResult.success, false);
+
+// Registry refreshes allocate new capabilities and deterministically retire old IDs.
+const refreshOpen = await openUrl(arbitrarySessionId, `http://127.0.0.1:${address.port}`);
+const oldRefreshLink = refreshOpen.observation?.elements.find((element) => element.name === "Next area");
+assert.ok(oldRefreshLink);
+const refreshedState = await observeSession(arbitrarySessionId);
+const newRefreshLink = refreshedState.observation?.elements.find((element) => element.name === "Next area");
+assert.ok(newRefreshLink);
+assert.notEqual(newRefreshLink.id, oldRefreshLink.id);
+assert.equal((await performAction(arbitrarySessionId, { action: "click", elementId: oldRefreshLink.id })).status, "STALE_ELEMENT");
+assert.equal((await observeSession(arbitrarySessionId)).status, "OBSERVED");
+
+// Scroll/re-observe never lets an earlier ID silently point at a different control.
+const scrollOpen = await openUrl(arbitrarySessionId, `http://127.0.0.1:${address.port}`);
+const preScrollLink = scrollOpen.observation?.elements.find((element) => element.name === "Next area");
+assert.ok(preScrollLink);
+assert.equal((await performAction(arbitrarySessionId, { action: "scroll", direction: "down" })).status, "ACTION_COMPLETED");
+assert.equal((await performAction(arbitrarySessionId, { action: "click", elementId: preScrollLink.id })).status, "STALE_ELEMENT");
+
+// Navigation invalidates every capability from the previous document.
+const oldPageOpen = await openUrl(arbitrarySessionId, `http://127.0.0.1:${address.port}`);
+const oldPageLink = oldPageOpen.observation?.elements.find((element) => element.name === "Next area");
+const oldPageCheckbox = oldPageOpen.observation?.elements.find((element) => element.name === "Receive updates");
+assert.ok(oldPageLink && oldPageCheckbox);
+assert.equal((await performAction(arbitrarySessionId, { action: "click", elementId: oldPageLink.id })).status, "ACTION_COMPLETED");
+assert.equal((await performAction(arbitrarySessionId, { action: "check", elementId: oldPageCheckbox.id })).status, "STALE_ELEMENT");
+
+// A moved DOM node retains its own handle; a replaced node is rejected rather than retargeted.
+const moveOpen = await openUrl(arbitrarySessionId, `http://127.0.0.1:${address.port}/reorder-move`);
+const movingAlpha = moveOpen.observation?.elements.find((element) => element.name === "Alpha game");
+assert.ok(movingAlpha);
+await new Promise((resolve) => setTimeout(resolve, 900));
+const movedResult = await performAction(arbitrarySessionId, { action: "click", elementId: movingAlpha.id });
+assert.equal(movedResult.status, "ACTION_COMPLETED");
+assert.equal(movedResult.observation?.title, "Alpha target");
+
+const replaceOpen = await openUrl(arbitrarySessionId, `http://127.0.0.1:${address.port}/reorder-replace`);
+const replacedAlpha = replaceOpen.observation?.elements.find((element) => element.name === "Alpha game");
+assert.ok(replacedAlpha);
+await new Promise((resolve) => setTimeout(resolve, 900));
+assert.equal((await performAction(arbitrarySessionId, { action: "click", elementId: replacedAlpha.id })).status, "STALE_ELEMENT");
+
+// Broad user wording never pre-authorizes a write or satisfies its confirmation.
+const bypassOpen = await openUrl(arbitrarySessionId, `http://127.0.0.1:${address.port}`);
+const bypassSave = bypassOpen.observation?.elements.find((element) => element.name === "Save Customer");
+const destructiveLink = bypassOpen.observation?.elements.find((element) => element.name === "Delete account");
+assert.ok(bypassSave && destructiveLink);
+assert.equal((await performAction(arbitrarySessionId, { action: "click", elementId: destructiveLink.id })).status, "ACTION_NEEDS_CONFIRMATION");
+await performAction(arbitrarySessionId, { action: "cancel_pending" });
+assert.equal((await performAction(arbitrarySessionId, { action: "click", elementId: bypassSave.id, confirmation: "do it always don't ask me" })).status, "ACTION_NEEDS_CONFIRMATION");
+assert.equal((await performAction(arbitrarySessionId, { action: "confirm_pending", confirmation: "do it always don't ask me" })).status, "CONFIRMATION_REJECTED");
 
 const loginOpen = await openUrl(arbitrarySessionId, `http://127.0.0.1:${address.port}/login`);
 assert.equal(loginOpen.status, "AUTH_REQUIRED");
@@ -341,12 +432,16 @@ assert.match(loginRouteSource, /loginBrowser/);
 const workerSource = readFileSync("browser-worker/sessions.ts", "utf8");
 assert.match(workerSource, /username = ""/);
 assert.match(workerSource, /password = ""/);
-assert.match(workerSource, /liveAccessibleName/);
+assert.match(workerSource, /inspectRegisteredElement/);
 assert.match(workerSource, /pageSignature/);
 assert.match(workerSource, /effectVerified/);
 assert.doesNotMatch(workerSource, /role: "button", name: pending/);
 assert.match(workerSource, /pendingElementStillMatches/);
 assert.match(workerSource, /ACTION_UNVERIFIED/);
+assert.match(workerSource, /READ_NAVIGATION/);
+assert.match(workerSource, /STALE_ELEMENT/);
+assert.match(workerSource, /NAVIGATION_UNVERIFIED/);
+assert.match(workerSource, /DOWNLOAD_REQUIRES_HANDLING/);
 assert.match(workerSource, /animations: "disabled"/);
 assert.match(workerSource, /caret: "hide"/);
 assert.match(workerSource, /SENSITIVE_SCREENSHOT_SELECTOR/);
@@ -394,6 +489,11 @@ const pollingSection = pageSource.slice(
 );
 assert.doesNotMatch(pollingSection, /ollama|fetch\("\/api\/kino"\)/i);
 assert.match(controllerSource, /Ordinary page navigation is a read action/);
+assert.match(controllerSource, /STALE_ELEMENT/);
+assert.match(controllerSource, /web_observe/);
+assert.equal(shouldContinueSafeBrowserNarration("Open the Forza page", "I've returned to the main page. Now I can see the link. Let me click on it.", 0), true);
+assert.equal(shouldContinueSafeBrowserNarration("Open the Forza page", "The requested page is now open.", 0), false);
+assert.equal(shouldContinueSafeBrowserNarration("Open the Forza page", "Let me click on it.", 2), false);
 const loginSection = workerSource.slice(
   workerSource.indexOf("export async function loginSession"),
   workerSource.indexOf("export async function closeSession"),

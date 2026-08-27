@@ -3,10 +3,10 @@ import { randomUUID } from "node:crypto";
 import { chromium, type Browser, type BrowserContext, type Locator, type Page } from "playwright";
 
 import { buildCriticalConfirmationPhrase, parseActionConfirmation } from "../lib/kino/web-agent/action-confirmation.ts";
-import { classifyActionRisk } from "../lib/kino/web-agent/action-risk.ts";
+import { classifyActionRisk, explicitExternalEffectRisk } from "../lib/kino/web-agent/action-risk.ts";
 import { isSensitiveFormField } from "../lib/kino/web-agent/form-matcher.ts";
 import type { BrowserActionKind, BrowserActionResult, BrowserObservation, BrowserOpenResult, BrowserSessionState, BrowserViewState, PendingBrowserAction } from "../lib/kino/browser-worker/types.ts";
-import { observePage, type ElementRegistry, type RegisteredElement } from "./observer.ts";
+import { inspectRegisteredElement, observePage, type ElementRegistry, type RegisteredElement } from "./observer.ts";
 import { developmentPrivateNetworkEscapeEnabled, routedRequestProtocolPolicy, validatePublicUrl } from "./url-security.ts";
 
 const configuredSessionTtl = Number.parseInt(process.env.KINO_BROWSER_SESSION_TTL_MS ?? "1800000", 10);
@@ -33,6 +33,9 @@ type PendingElementIdentity = {
   href?: string;
   checked?: boolean;
   disabled: boolean;
+  fingerprint: string;
+  observationGeneration: number;
+  documentGeneration: number;
 };
 
 type BrowserSession = {
@@ -46,6 +49,10 @@ type BrowserSession = {
   navigationBlocked?: string;
   learnedNavigation: Set<string>;
   validatedHosts: Map<string, { allowed: boolean; message: string; expiresAt: number }>;
+  nextElementOrdinal: number;
+  observationGeneration: number;
+  documentGeneration: number;
+  retiredElementIds: Set<string>;
 };
 
 const sessions = new Map<string, BrowserSession>();
@@ -135,7 +142,20 @@ async function createSession(sessionId: string) {
     lastActive: Date.now(),
     learnedNavigation: new Set(),
     validatedHosts: new Map(),
+    nextElementOrdinal: 1,
+    observationGeneration: 0,
+    documentGeneration: 0,
+    retiredElementIds: new Set(),
   };
+  page.on("framenavigated", (frame) => {
+    if (frame !== page.mainFrame()) return;
+    session.documentGeneration += 1;
+    for (const [elementId, entry] of session.registry) {
+      session.retiredElementIds.add(elementId);
+      void entry.handle.dispose().catch(() => {});
+    }
+    session.registry.clear();
+  });
   await installNavigationGuard(session);
   sessions.set(sessionId, session);
   return session;
@@ -154,7 +174,18 @@ function activeSession(sessionId: string) {
 }
 
 async function observation(session: BrowserSession) {
-  const result = await observePage(session.page, session.registry);
+  for (const elementId of session.registry.keys()) session.retiredElementIds.add(elementId);
+  while (session.retiredElementIds.size > 5_000) {
+    const oldest = session.retiredElementIds.values().next().value as string | undefined;
+    if (!oldest) break;
+    session.retiredElementIds.delete(oldest);
+  }
+  session.observationGeneration += 1;
+  const result = await observePage(session.page, session.registry, {
+    allocateElementId: () => `e${session.nextElementOrdinal++}`,
+    observationGeneration: session.observationGeneration,
+    documentGeneration: session.documentGeneration,
+  });
   result.learnedNavigation.forEach((name) => session.learnedNavigation.add(name));
   result.learnedNavigation = Array.from(session.learnedNavigation).slice(-60);
   session.lastObservation = result;
@@ -275,16 +306,47 @@ export async function observeSession(sessionId: string): Promise<BrowserSessionS
 }
 
 function actionDestination(element: RegisteredElement) {
-  if (element.semantic.role !== "link" || !element.semantic.href) return "none" as const;
+  if (element.semantic.role !== "link" || !element.trustedHref) return "none" as const;
   const current = new URL(element.pageUrl);
-  const target = new URL(element.semantic.href);
+  const target = new URL(element.trustedHref);
   return current.href === target.href ? "same-page" as const : current.origin === target.origin ? "same-origin" as const : "external" as const;
 }
 
-function actionRisk(element: RegisteredElement, action: BrowserActionKind) {
-  if (["fill", "select", "back", "reload", "scroll"].includes(action)) return { risk: "read" as const, reason: "The action does not commit external state." };
-  if (["check", "uncheck"].includes(action)) return { risk: "write" as const, reason: "Changing this control may modify application state." };
-  if (element.semantic.role === "link") return { risk: "read" as const, reason: "A link performs navigation." };
+type ActionClassification = {
+  risk: "read" | "write" | "critical";
+  capability: "READ_NAVIGATION" | "READ_INTERACTION" | "DOWNLOAD" | "EXTERNAL_EFFECT";
+  reason: string;
+};
+
+const DOWNLOAD_FILE_EXTENSION = /\.(?:zip|rar|7z|tar|gz|bz2|xz|exe|msi|dmg|pkg|deb|rpm|apk|iso|csv|xlsx?|docx?|pptx?)(?:$|[?#])/i;
+
+function downloadLike(element: RegisteredElement) {
+  return element.download ||
+    /\b(?:download|export|save (?:file|archive)|installer)\b/i.test(element.semantic.name) ||
+    Boolean(element.trustedHref && DOWNLOAD_FILE_EXTENSION.test(element.trustedHref));
+}
+
+function classifyElementAction(element: RegisteredElement, action: BrowserActionKind): ActionClassification {
+  if (["fill", "select", "back", "reload", "scroll"].includes(action)) {
+    return { risk: "read", capability: "READ_INTERACTION", reason: "The action does not commit external state." };
+  }
+  if (["check", "uncheck"].includes(action)) {
+    return { risk: "write", capability: "EXTERNAL_EFFECT", reason: "Changing this control may modify application state." };
+  }
+  if (element.semantic.role === "link") {
+    if (downloadLike(element)) return { risk: "read", capability: "DOWNLOAD", reason: "Downloads require explicit handling that is not enabled." };
+    const explicitEffect = explicitExternalEffectRisk(element.semantic.name);
+    if (explicitEffect) {
+      return {
+        risk: explicitEffect,
+        capability: "EXTERNAL_EFFECT",
+        reason: explicitEffect === "critical"
+          ? "The link describes a destructive, security-sensitive, or financial action."
+          : "The link explicitly describes an external state change.",
+      };
+    }
+    return { risk: "read", capability: "READ_NAVIGATION", reason: "A normal HTTP(S) link is read-only navigation." };
+  }
   const classified = classifyActionRisk({
     name: element.semantic.name,
     role: ["button", "link", "tab", "checkbox", "radio", "switch"].includes(element.semantic.role)
@@ -293,25 +355,13 @@ function actionRisk(element: RegisteredElement, action: BrowserActionKind) {
     destination: actionDestination(element),
   });
   if (element.buttonType !== "submit" && /^(?:add|new|create|edit)\b/i.test(element.semantic.name) && classified.risk === "write") {
-    return { risk: "read" as const, reason: "The non-submit control appears to open an editing interface." };
+    return { risk: "read", capability: "READ_INTERACTION", reason: "The non-submit control appears to open an editing interface." };
   }
-  return classified;
+  return { ...classified, capability: classified.risk === "read" ? "READ_INTERACTION" : "EXTERNAL_EFFECT" };
 }
 
 async function pageSignature(page: Page) {
   return `${page.url()}\n${await page.title()}\n${(await page.locator("body").innerText().catch(() => "")).slice(0, 4_000)}`;
-}
-
-async function liveAccessibleName(locator: Locator) {
-  return locator.evaluate((node) => {
-    const element = node as HTMLElement & { labels?: NodeListOf<HTMLLabelElement> };
-    const labels = element.labels ? Array.from(element.labels).map((label) => label.innerText.trim()).filter(Boolean).join(" ") : "";
-    return (
-      element.getAttribute("aria-label")?.trim() || labels ||
-      (element.innerText || element.textContent || "").trim().replace(/\s+/g, " ") ||
-      element.getAttribute("placeholder")?.trim() || ""
-    ).slice(0, 200);
-  }).catch(() => "");
 }
 
 function pendingIdentity(element: RegisteredElement): PendingElementIdentity {
@@ -325,60 +375,24 @@ function pendingIdentity(element: RegisteredElement): PendingElementIdentity {
     href: element.semantic.href,
     checked: element.semantic.checked,
     disabled: element.semantic.disabled,
+    fingerprint: element.fingerprint,
+    observationGeneration: element.observationGeneration,
+    documentGeneration: element.documentGeneration,
   };
 }
 
-async function liveElementIdentity(locator: Locator, pageUrl: string) {
-  return locator.evaluate((node) => {
-    const element = node as HTMLElement;
-    const input = element as HTMLInputElement;
-    return {
-      tagName: element.tagName.toLowerCase(),
-      explicitRole: element.getAttribute("role")?.toLowerCase() ?? "",
-      inputType: input.type?.toLowerCase() ?? "",
-      buttonType: element.tagName === "BUTTON" ? (element as HTMLButtonElement).type : undefined,
-      href: element.getAttribute("href"),
-      checked: typeof input.checked === "boolean" ? input.checked : undefined,
-      disabled: Boolean(input.disabled || element.getAttribute("aria-disabled") === "true"),
-    };
-  }).then((live) => {
-    const role = ["button", "link", "tab", "checkbox", "radio", "switch"].includes(live.explicitRole)
-      ? live.explicitRole
-      : live.tagName === "a" ? "link"
-        : live.tagName === "button" || ["button", "submit", "reset"].includes(live.inputType) ? "button"
-          : live.tagName === "select" ? "combobox"
-            : live.inputType === "checkbox" ? "checkbox"
-              : live.inputType === "radio" ? "radio"
-                : live.inputType === "search" ? "searchbox" : "textbox";
-    let href: string | undefined;
-    if (live.href) {
-      try {
-        const url = new URL(live.href, pageUrl);
-        if (["http:", "https:"].includes(url.protocol) && !url.username && !url.password) {
-          url.search = "";
-          url.hash = "";
-          href = url.href;
-        }
-      } catch {}
-    }
-    return { ...live, role, href };
-  }).catch(() => null);
+async function elementStillMatches(session: BrowserSession, element: RegisteredElement) {
+  if (session.page.url() !== element.pageUrl || element.documentGeneration !== session.documentGeneration) return false;
+  if (!(await element.handle.isVisible().catch(() => false)) || !(await element.handle.isEnabled().catch(() => false))) return false;
+  const live = await inspectRegisteredElement(element, session.page.url());
+  return Boolean(live && !live.disabled && live.fingerprint === element.fingerprint);
 }
 
-async function pendingElementStillMatches(pending: InternalPendingAction, page: Page) {
-  if (page.url() !== pending.identity.pageUrl) return false;
-  const locator = pending.element.locator;
-  if (!(await locator.isVisible().catch(() => false)) || !(await locator.isEnabled().catch(() => false))) return false;
-  const [name, live] = await Promise.all([liveAccessibleName(locator), liveElementIdentity(locator, pending.identity.pageUrl)]);
-  if (!live) return false;
-  return name === pending.identity.name &&
-    live.role === pending.identity.role &&
-    live.tagName === pending.identity.tagName &&
-    (live.buttonType || undefined) === pending.identity.buttonType &&
-    (live.inputType || undefined) === pending.identity.inputType &&
-    live.href === pending.identity.href &&
-    live.checked === pending.identity.checked &&
-    live.disabled === pending.identity.disabled;
+async function pendingElementStillMatches(pending: InternalPendingAction, session: BrowserSession) {
+  return pending.identity.fingerprint === pending.element.fingerprint &&
+    pending.identity.observationGeneration === pending.element.observationGeneration &&
+    pending.identity.documentGeneration === session.documentGeneration &&
+    await elementStillMatches(session, pending.element);
 }
 
 const SUCCESS_EVIDENCE = /\b(?:success|saved|created|updated|deleted|sent|completed|submitted|refunded|done)\b/i;
@@ -394,50 +408,86 @@ async function executeElementAction(
   element: RegisteredElement,
   value?: string | number | boolean,
   committedRisk: "write" | "critical" | null = null,
+  capability: ActionClassification["capability"] = "READ_INTERACTION",
 ) {
-  const locator = element.locator;
-  if (!(await locator.isVisible().catch(() => false)) || !(await locator.isEnabled().catch(() => false)) || element.semantic.disabled) {
-    return failure("ELEMENT_NOT_ACTIONABLE", "The semantic element is no longer actionable.");
-  }
-  if (action === "click" && element.semantic.role === "link") {
-    const liveLink = await liveElementIdentity(locator, session.page.url());
-    if (!liveLink?.href) return failure("URL_BLOCKED", "Only HTTP(S) link navigation is allowed.");
-    if (liveLink.href !== element.semantic.href) return failure("PAGE_CHANGED", "The link destination changed after it was observed.");
+  const handle = element.handle;
+  if (!(await elementStillMatches(session, element)) || element.semantic.disabled) return failure("STALE_ELEMENT", "The semantic element changed or expired; observe the page again before acting.");
+  if (capability === "DOWNLOAD") return failure("DOWNLOAD_REQUIRES_HANDLING", "KINO did not activate this download because explicit download handling is not enabled.");
+  if (capability === "READ_NAVIGATION") {
+    if (!element.trustedHref) return failure("URL_BLOCKED", "Only HTTP(S) link navigation is allowed.");
+    const validation = await validatePublicUrl(element.trustedHref, { allowPrivate: developmentPrivateNetworkEscapeEnabled() });
+    if (!validation.allowed) return failure(validation.status, validation.message);
   }
   const before = await pageSignature(session.page);
   const beforeUrl = session.page.url();
-  const beforeName = await liveAccessibleName(locator);
+  const beforeDocumentGeneration = session.documentGeneration;
+  const beforeName = (await inspectRegisteredElement(element, beforeUrl))?.name ?? element.semantic.name;
   const beforeStatusTexts = new Set(await statusTexts(session.page));
-  const form = locator.locator("xpath=ancestor::form[1]");
+  const form = element.locator.locator("xpath=ancestor::form[1]");
   const formWasVisible = await form.isVisible().catch(() => false);
-  if (action === "click") await locator.click({ timeout: 10_000 });
+  const possibleDownload = capability === "READ_NAVIGATION"
+    ? session.page.waitForEvent("download", { timeout: 1_500 }).catch(() => null)
+    : Promise.resolve(null);
+  session.navigationBlocked = undefined;
+  if (action === "click") await handle.click({ timeout: 10_000 });
   else if (action === "fill") {
     if (element.semantic.inputType === "password" || isSensitiveFormField({ name: element.semantic.name })) {
       return failure("ELEMENT_NOT_ACTIONABLE", "Sensitive fields can only be filled through secure login.");
     }
     if (typeof value !== "string" && typeof value !== "number") return failure("INVALID_REQUEST", "A simple ordinary field value is required.");
-    await locator.fill(String(value));
-    if ((await locator.inputValue()) !== String(value)) return failure("ACTION_FAILED", "The ordinary field value could not be verified.");
+    await handle.fill(String(value));
+    if ((await handle.inputValue()) !== String(value)) return failure("ACTION_FAILED", "The ordinary field value could not be verified.");
   } else if (action === "select") {
     if (typeof value !== "string") return failure("INVALID_REQUEST", "A discovered native option is required.");
     if (!element.semantic.options?.includes(value)) return failure("INVALID_REQUEST", "The requested value is not one of the discovered native options.");
-    await locator.selectOption({ label: value });
-  } else if (action === "check") await locator.check();
-  else if (action === "uncheck") await locator.uncheck();
+    await handle.selectOption({ label: value });
+  } else if (action === "check") await handle.check();
+  else if (action === "uncheck") await handle.uncheck();
   await session.page.waitForLoadState("domcontentloaded", { timeout: 5_000 }).catch(() => {});
   await session.page.waitForLoadState("networkidle", { timeout: 3_000 }).catch(() => {});
   if (session.navigationBlocked) return failure("URL_BLOCKED", session.navigationBlocked);
+  const download = await possibleDownload;
+  if (download) {
+    await download.cancel().catch(() => {});
+    const observed = await observation(session).catch(() => undefined);
+    return {
+      success: false,
+      status: "DOWNLOAD_REQUIRES_HANDLING" as const,
+      message: "The server responded with a download. KINO cancelled it because explicit download handling is not enabled.",
+      action,
+      elementId: element.semantic.id,
+      effectVerified: false,
+      observation: observed,
+    };
+  }
+  if (capability === "READ_NAVIGATION") {
+    const afterUrl = session.page.url();
+    const exactExpectedDestination = afterUrl === element.trustedHref;
+    const actionLinkedNavigation = afterUrl !== beforeUrl && session.documentGeneration > beforeDocumentGeneration;
+    const verified = exactExpectedDestination || actionLinkedNavigation;
+    const observed = await observation(session);
+    return {
+      success: verified,
+      status: verified ? "ACTION_COMPLETED" as const : "NAVIGATION_UNVERIFIED" as const,
+      message: verified
+        ? "The read-only navigation completed and its destination was verified."
+        : "The link was activated, but the expected navigation could not be verified.",
+      action,
+      elementId: element.semantic.id,
+      effectVerified: verified,
+      observation: observed,
+    };
+  }
   const controlVerified = action === "check"
-    ? await locator.isChecked().catch(() => false)
+    ? await handle.isChecked().catch(() => false)
     : action === "uncheck"
-      ? !(await locator.isChecked().catch(() => true))
+      ? !(await handle.isChecked().catch(() => true))
       : action === "select"
-        ? (await locator.locator("option:checked").textContent().catch(() => ""))?.trim() === String(value)
+        ? await handle.evaluate((node) => (node as HTMLSelectElement).selectedOptions[0]?.textContent?.trim() ?? "").catch(() => "") === String(value)
         : action === "fill";
-  const targetExists = await locator.count().then((count) => count > 0).catch(() => false);
-  const targetVisible = targetExists && await locator.isVisible({ timeout: 500 }).catch(() => false);
-  const targetEnabled = targetVisible && await locator.isEnabled({ timeout: 500 }).catch(() => false);
-  const afterName = targetVisible ? await liveAccessibleName(locator) : "";
+  const targetVisible = await handle.isVisible().catch(() => false);
+  const targetEnabled = targetVisible && await handle.isEnabled().catch(() => false);
+  const afterName = targetVisible ? (await inspectRegisteredElement(element, session.page.url()))?.name ?? "" : "";
   const newPositiveStatus = (await statusTexts(session.page)).some((text) => !beforeStatusTexts.has(text) && SUCCESS_EVIDENCE.test(text));
   const stronglyVerified = controlVerified ||
     session.page.url() !== beforeUrl ||
@@ -502,19 +552,20 @@ export async function performAction(
       requiredPhrase: pending.public.requiredConfirmationPhrase,
     });
     if (!parsed.explicit) return failure("CONFIRMATION_REJECTED", parsed.reason === "STRONG_CONFIRMATION_REQUIRED" ? `Critical confirmation requires: ${pending.public.requiredConfirmationPhrase}` : "The latest message did not explicitly confirm the exact pending action.");
-    if (!(await pendingElementStillMatches(pending, session.page))) {
+    if (!(await pendingElementStillMatches(pending, session))) {
       session.pending = undefined;
-      return failure("PAGE_CHANGED", "The page or pending control changed before confirmation.");
+      return failure("STALE_ELEMENT", "The page or pending control changed before confirmation; observe the page again.");
     }
     session.pending = undefined;
     audit(sessionId, "confirm", "ACTION_EXECUTION_STARTED", { risk: pending.public.risk, semanticElement: pending.public.elementId });
-    const result = await executeElementAction(session, pending.public.action, pending.element, pending.value, pending.public.risk);
+    const result = await executeElementAction(session, pending.public.action, pending.element, pending.value, pending.public.risk, "EXTERNAL_EFFECT");
     audit(sessionId, "confirm", result.status, { risk: pending.public.risk, verified: result.effectVerified === true });
     return result;
   }
 
   const action = request.action as BrowserActionKind;
   if (["back", "reload", "scroll"].includes(action)) {
+    session.navigationBlocked = undefined;
     if (action === "back") await session.page.goBack({ waitUntil: "domcontentloaded" });
     else if (action === "reload") await session.page.reload({ waitUntil: "domcontentloaded" });
     else await session.page.mouse.wheel(0, request.direction === "up" ? -700 : 700);
@@ -523,16 +574,28 @@ export async function performAction(
   }
   if (!request.elementId || !/^e\d+$/.test(request.elementId)) return failure("INVALID_REQUEST", "A semantic element ID from the latest observation is required.");
   const element = session.registry.get(request.elementId);
-  if (!element) return failure("ELEMENT_NOT_FOUND", "The semantic element is not present in the latest observation.");
-  if (element.pageUrl !== session.page.url()) return failure("PAGE_CHANGED", "The page changed after the semantic element was observed.");
-  const classification = actionRisk(element, action);
+  if (!element) {
+    return session.retiredElementIds.has(request.elementId)
+      ? failure("STALE_ELEMENT", "That semantic element belongs to an older page observation; observe the page again.")
+      : failure("ELEMENT_NOT_FOUND", "The semantic element is not present in the latest observation.");
+  }
+  if (!(await elementStillMatches(session, element))) {
+    session.retiredElementIds.add(request.elementId);
+    session.registry.delete(request.elementId);
+    await element.handle.dispose().catch(() => {});
+    return failure("STALE_ELEMENT", "The semantic element changed or expired; observe the page again before acting.");
+  }
+  const classification = classifyElementAction(element, action);
+  if (classification.capability === "DOWNLOAD") {
+    return failure("DOWNLOAD_REQUIRES_HANDLING", "KINO did not activate this download because explicit download handling is not enabled.");
+  }
   if (classification.risk !== "read") {
     const pending = publicPending(element, action, classification.risk);
     session.pending = { public: pending, element, identity: pendingIdentity(element), value: request.value };
     audit(sessionId, action, "ACTION_NEEDS_CONFIRMATION", { risk: classification.risk, semanticElement: element.semantic.id });
     return { success: true, status: "ACTION_NEEDS_CONFIRMATION", message: classification.reason, action, elementId: element.semantic.id, effectVerified: false, pendingAction: pending };
   }
-  const result = await executeElementAction(session, action, element, request.value);
+  const result = await executeElementAction(session, action, element, request.value, null, classification.capability);
   audit(sessionId, action, result.status, { semanticElement: element.semantic.id, verified: result.effectVerified === true });
   return result;
 }

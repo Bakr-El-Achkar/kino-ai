@@ -1,13 +1,19 @@
-import type { Locator, Page } from "playwright";
+import type { ElementHandle, Locator, Page } from "playwright";
 
 import type { BrowserObservation, SemanticElement, SemanticElementRole } from "../lib/kino/browser-worker/types.ts";
 
 export type RegisteredElement = {
   locator: Locator;
+  handle: ElementHandle<HTMLElement>;
   semantic: SemanticElement;
   pageUrl: string;
   tagName: string;
   buttonType?: string;
+  trustedHref?: string;
+  download: boolean;
+  fingerprint: string;
+  observationGeneration: number;
+  documentGeneration: number;
 };
 
 export type ElementRegistry = Map<string, RegisteredElement>;
@@ -34,6 +40,17 @@ function safeHref(value: string | null, pageUrl: string) {
     if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) return undefined;
     url.search = "";
     url.hash = "";
+    return url.href;
+  } catch {
+    return undefined;
+  }
+}
+
+function trustedHref(value: string | null, pageUrl: string) {
+  if (!value) return undefined;
+  try {
+    const url = new URL(value, pageUrl);
+    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) return undefined;
     return url.href;
   } catch {
     return undefined;
@@ -67,10 +84,12 @@ type ElementMetadata = {
   options?: string[];
   href: string | null;
   buttonType?: string;
+  download: boolean;
+  formRelationship: string;
 };
 
-async function metadata(locator: Locator): Promise<ElementMetadata> {
-  return locator.evaluate((node) => {
+async function metadata(handle: ElementHandle<HTMLElement>): Promise<ElementMetadata> {
+  return handle.evaluate((node) => {
     const element = node as HTMLElement;
     const input = element as HTMLInputElement;
     const select = element as HTMLSelectElement;
@@ -89,8 +108,42 @@ async function metadata(locator: Locator): Promise<ElementMetadata> {
       options: select.tagName === "SELECT" ? Array.from(select.options).map((option) => option.textContent?.trim() || "").filter(Boolean).slice(0, 100) : undefined,
       href: element.getAttribute("href"),
       buttonType: element.tagName === "BUTTON" ? (element as HTMLButtonElement).type : undefined,
+      download: element.hasAttribute("download") || element.getAttribute("rel")?.split(/\s+/).includes("download") === true,
+      formRelationship: element.closest("form")
+        ? `${element.closest("form")?.getAttribute("method")?.toLowerCase() || "get"}:${element.closest("form")?.getAttribute("action") || ""}`
+        : "none",
     };
   });
+}
+
+function elementFingerprint(data: ElementMetadata, role: SemanticElementRole, name: string, href?: string) {
+  return JSON.stringify({
+    role,
+    name,
+    text: data.text,
+    tagName: data.tagName,
+    inputType: data.inputType,
+    buttonType: data.buttonType ?? "",
+    href: href ?? "",
+    download: data.download,
+    formRelationship: data.formRelationship,
+  });
+}
+
+export async function inspectRegisteredElement(element: RegisteredElement, pageUrl: string) {
+  const data = await metadata(element.handle).catch(() => null);
+  if (!data) return null;
+  const role = inferredRole(data.tagName, data.role, data.inputType);
+  const name = (data.label || data.text || data.placeholder || data.title || role).slice(0, 200);
+  const resolvedTrustedHref = role === "link" ? trustedHref(data.href, pageUrl) : undefined;
+  return {
+    role,
+    name,
+    href: resolvedTrustedHref,
+    disabled: data.disabled,
+    checked: data.checked,
+    fingerprint: elementFingerprint(data, role, name, resolvedTrustedHref),
+  };
 }
 
 function challengeStatus(text: string, hasPassword: boolean) {
@@ -99,21 +152,36 @@ function challengeStatus(text: string, hasPassword: boolean) {
   return hasPassword ? "AUTH_REQUIRED" as const : "OBSERVED" as const;
 }
 
-export async function observePage(page: Page, registry: ElementRegistry): Promise<BrowserObservation> {
+export async function observePage(
+  page: Page,
+  registry: ElementRegistry,
+  options: { allocateElementId?: () => string; observationGeneration?: number; documentGeneration?: number } = {},
+): Promise<BrowserObservation> {
+  await Promise.all(Array.from(registry.values()).map((entry) => entry.handle.dispose().catch(() => {})));
   registry.clear();
   await page.locator("body").waitFor({ state: "visible", timeout: 10_000 });
   const pageUrl = page.url();
   const candidates = page.locator(INTERACTIVE_SELECTOR);
   const elements: SemanticElement[] = [];
   const count = Math.min(await candidates.count(), 160);
+  let fallbackElementOrdinal = 0;
   for (let index = 0; index < count && elements.length < 80; index += 1) {
     const locator = candidates.nth(index);
-    if (!(await locator.isVisible().catch(() => false))) continue;
-    const data = await metadata(locator).catch(() => null);
-    if (!data) continue;
+    const handle = await locator.elementHandle().catch(() => null) as ElementHandle<HTMLElement> | null;
+    if (!handle || !(await handle.isVisible().catch(() => false))) {
+      await handle?.dispose().catch(() => {});
+      continue;
+    }
+    const data = await metadata(handle).catch(() => null);
+    if (!data) {
+      await handle.dispose().catch(() => {});
+      continue;
+    }
     const role = inferredRole(data.tagName, data.role, data.inputType);
     const name = (data.label || data.text || data.placeholder || data.title || role).slice(0, 200);
-    const id = `e${elements.length + 1}`;
+    fallbackElementOrdinal += 1;
+    const id = options.allocateElementId?.() ?? `e${fallbackElementOrdinal}`;
+    const resolvedTrustedHref = role === "link" ? trustedHref(data.href, pageUrl) : undefined;
     const semantic: SemanticElement = {
       id,
       role,
@@ -129,7 +197,19 @@ export async function observePage(page: Page, registry: ElementRegistry): Promis
       href: role === "link" ? safeHref(data.href, pageUrl) : undefined,
     };
     elements.push(semantic);
-    registry.set(id, { locator, semantic, pageUrl, tagName: data.tagName, buttonType: data.buttonType });
+    registry.set(id, {
+      locator,
+      handle,
+      semantic,
+      pageUrl,
+      tagName: data.tagName,
+      buttonType: data.buttonType,
+      trustedHref: resolvedTrustedHref,
+      download: data.download,
+      fingerprint: elementFingerprint(data, role, name, resolvedTrustedHref),
+      observationGeneration: options.observationGeneration ?? 1,
+      documentGeneration: options.documentGeneration ?? 1,
+    });
   }
 
   const bodyText = await page.locator("body").innerText().catch(() => "");

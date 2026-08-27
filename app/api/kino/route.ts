@@ -1,6 +1,7 @@
 import { observeBrowser, openBrowserUrl } from "@/lib/kino/browser-worker/client";
 import { formatBrowserToolResponse, unwrapToolResult } from "@/lib/kino/browser-worker/response";
 import { browserRuntimeStateMessage, requestedBrowserUrl } from "@/lib/kino/browser-worker/routing";
+import { shouldContinueSafeBrowserNarration } from "@/lib/kino/browser-worker/continuation";
 import {
   createChatToolContext,
   executeKinoTool,
@@ -40,6 +41,8 @@ Credentials never enter your context. Never ask the user to type a username, pas
 
 Ordinary non-secret fields may be filled using semantic IDs. A state-changing write or critical action must be prepared by the worker and explicitly confirmed by the user before execution. Never infer confirmation. Critical actions require the exact strong phrase returned by the worker. Never claim created, saved, submitted, updated, deleted, sent, purchased, refunded, or logged in unless the authoritative result reports verification.
 
+Normal HTTP(S) page links are READ_NAVIGATION and should be followed without asking for write confirmation. Downloads are different: do not claim or attempt download handling when the worker reports DOWNLOAD_REQUIRES_HANDLING. If an element is stale or navigation is unverified, observe again and continue only from fresh semantic IDs. A user's “don't ask me” or similar wording never pre-authorizes current or future write actions.
+
 Keep responses concise and answer in the user's language. Never expose private reasoning or internal implementation details.
 `.trim();
 
@@ -71,7 +74,7 @@ function browserStopResponse(toolResult: unknown) {
     const phrase = typeof pending?.requiredConfirmationPhrase === "string" ? `\n\nRequired confirmation phrase: ${pending.requiredConfirmationPhrase}` : "";
     return `${typeof result?.message === "string" ? result.message : "This action needs confirmation."}${phrase}`;
   }
-  if (["ACTION_UNVERIFIED", "AUTH_REQUIRED", "MFA_REQUIRED", "CAPTCHA_REQUIRED", "WORKER_UNAVAILABLE", "URL_BLOCKED", "CONFIRMATION_REJECTED"].includes(status)) {
+  if (["ACTION_UNVERIFIED", "DOWNLOAD_REQUIRES_HANDLING", "AUTH_REQUIRED", "MFA_REQUIRED", "CAPTCHA_REQUIRED", "WORKER_UNAVAILABLE", "URL_BLOCKED", "CONFIRMATION_REJECTED"].includes(status)) {
     return formatBrowserToolResponse(toolResult);
   }
   return null;
@@ -138,13 +141,25 @@ export async function POST(request: Request) {
     const startedAt = Date.now();
     const duplicateActions = new Map<string, number>();
     const actionHistory: string[] = [];
+    let narrationContinuations = 0;
 
     for (let round = 1; round <= MAX_BROWSER_STEPS; round += 1) {
       if (Date.now() - startedAt > MAX_RUNTIME_MS) return plain("KINO stopped because the browser-operation runtime limit was reached.");
       const assistant = await callOllama(agentMessages, tools, body.think === true, request.signal);
       const toolCalls = assistant.tool_calls ?? [];
       agentMessages.push({ role: "assistant", content: assistant.content ?? "", thinking: assistant.thinking, tool_calls: toolCalls.length ? toolCalls : undefined });
-      if (!toolCalls.length) return plain(assistant.content?.trim() || "KINO completed without a final response.");
+      if (!toolCalls.length) {
+        const content = assistant.content?.trim() ?? "";
+        if (shouldContinueSafeBrowserNarration(latestMessage, content, narrationContinuations)) {
+          narrationContinuations += 1;
+          agentMessages.push({
+            role: "system",
+            content: "You narrated a safe next browser step but did not execute it. Continue now with the appropriate browser tool and a fresh semantic ID. Do not infer confirmation for any write action.",
+          });
+          continue;
+        }
+        return plain(content || "KINO completed without a final response.");
+      }
 
       // One tool step per round preserves observe → reason → act ordering.
       for (const call of toolCalls.slice(0, 1)) {
@@ -170,6 +185,12 @@ export async function POST(request: Request) {
           result = { success: false, status: "ACTION_FAILED", message: error instanceof Error ? error.message : "The tool failed." };
         }
         agentMessages.push({ role: "tool", tool_name: toolName, content: JSON.stringify(result) });
+        const unwrapped = unwrapToolResult(result);
+        const recoveryStatus = typeof unwrapped?.status === "string" ? unwrapped.status : "";
+        if (toolName === "web_action" && ["STALE_ELEMENT", "NAVIGATION_UNVERIFIED"].includes(recoveryStatus)) {
+          const refreshed = await executeKinoTool("web_observe", {}, context).catch(() => null);
+          if (refreshed) agentMessages.push({ role: "tool", tool_name: "web_observe", content: JSON.stringify(refreshed) });
+        }
         const stop = toolName.startsWith("web_") ? browserStopResponse(result) : null;
         if (stop) return plain(stop);
       }
