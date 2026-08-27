@@ -5,6 +5,13 @@ import { shouldContinueSafeBrowserNarration } from "@/lib/kino/browser-worker/co
 import { safeErrorDiagnostics, type AgentPhase, withTransientAiTransportRetry } from "@/lib/kino/ollama/transport-retry";
 import { ollamaHttpErrorDiagnostics } from "@/lib/kino/ollama/http-error-diagnostics";
 import {
+  buildQwenAgentTranscript,
+  type ContinuationReason,
+  type OllamaToolCall,
+  type OllamaTranscriptMessage,
+  type VisibleConversationMessage,
+} from "@/lib/kino/ollama/transcript";
+import {
   createChatToolContext,
   executeKinoTool,
   getOllamaTools,
@@ -19,14 +26,9 @@ const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY?.trim();
 const MAX_BROWSER_STEPS = Math.min(25, Math.max(5, Number.parseInt(process.env.KINO_BROWSER_MAX_STEPS ?? "20", 10) || 20));
 const MAX_RUNTIME_MS = Math.max(30_000, Number.parseInt(process.env.KINO_BROWSER_MAX_RUNTIME_MS ?? "180000", 10) || 180_000);
 
-type UserChatMessage = { role: "user" | "assistant"; content: string };
-type ToolCall = { type?: "function"; function: { name: string; arguments?: Record<string, unknown> } };
-type AgentMessage =
-  | { role: "system" | "user"; content: string }
-  | { role: "assistant"; content: string; thinking?: string; tool_calls?: ToolCall[] }
-  | { role: "tool"; tool_name: string; content: string };
+type UserChatMessage = VisibleConversationMessage;
 type OllamaResponse = {
-  message?: { content?: string; thinking?: string; tool_calls?: ToolCall[] };
+  message?: { content?: string; thinking?: string; tool_calls?: OllamaToolCall[] };
   error?: string;
 };
 type AiTransportStage = "NOT_STARTED" | "FETCHING_HEADERS" | "READING_ERROR_BODY" | "READING_BODY" | "VALIDATING_RESPONSE";
@@ -84,7 +86,7 @@ function browserStopResponse(toolResult: unknown) {
 }
 
 async function callOllama(
-  messages: AgentMessage[],
+  messages: OllamaTranscriptMessage[],
   tools: ReturnType<typeof getOllamaTools>,
   deepMode: boolean,
   signal: AbortSignal,
@@ -121,8 +123,10 @@ async function callOllama(
       secrets: OLLAMA_API_KEY ? [OLLAMA_API_KEY] : [],
     });
     onHttpError(diagnostics);
-    const httpError = new Error(`Ollama returned HTTP ${response.status}.`);
-    httpError.name = "OllamaHttpError";
+    const transcriptInvalid = diagnostics.modelErrorClassification === "MODEL_TRANSCRIPT_INVALID";
+    const httpError = new Error(transcriptInvalid ? "The model rejected the internal transcript." : `Ollama returned HTTP ${response.status}.`);
+    httpError.name = transcriptInvalid ? "ModelTranscriptInvalidError" : "OllamaHttpError";
+    if (transcriptInvalid) Object.assign(httpError, { code: "MODEL_TRANSCRIPT_INVALID" });
     throw httpError;
   }
   onStage("READING_BODY");
@@ -170,27 +174,34 @@ export async function POST(request: Request) {
       return plain(formatBrowserToolResponse(result));
     }
 
-    const agentMessages: AgentMessage[] = [
-      { role: "system", content: `${KINO_SYSTEM_PROMPT}\n\n${browserRuntimeStateMessage()}` },
-      ...messages.map((message) => ({ role: message.role, content: message.content } as AgentMessage)),
-    ];
+    const systemMessage = `${KINO_SYSTEM_PROMPT}\n\n${browserRuntimeStateMessage()}`;
+    const visibleConversation = messages.map((message) => ({ ...message }));
+    const toolTranscript: OllamaTranscriptMessage[] = [];
     const tools = getOllamaTools();
     const startedAt = requestStartedAt;
     const duplicateActions = new Map<string, number>();
     const actionHistory: string[] = [];
     let narrationContinuations = 0;
+    let continuationReason: ContinuationReason = "TOOL_RESULT";
 
     for (let round = 1; round <= MAX_BROWSER_STEPS; round += 1) {
       agentStep = round;
       agentPhase = round === 1 ? "INITIAL_REASONING" : "CONTINUATION";
       if (Date.now() - startedAt > MAX_RUNTIME_MS) return plain("KINO stopped because the browser-operation runtime limit was reached.");
+      const requestMessages = buildQwenAgentTranscript({
+        systemMessage,
+        visibleConversation,
+        toolTranscript,
+        activeUserGoal: latestMessage,
+        continuationReason: round === 1 ? undefined : continuationReason,
+      });
       let aiRequestAttempt = 0;
       const assistant = await withTransientAiTransportRetry(
         () => {
           const retryAttempt = aiRequestAttempt;
           aiRequestAttempt += 1;
           return callOllama(
-            agentMessages,
+            requestMessages,
             tools,
             body.think === true,
             request.signal,
@@ -221,16 +232,13 @@ export async function POST(request: Request) {
         },
       );
       const toolCalls = assistant.tool_calls ?? [];
-      agentMessages.push({ role: "assistant", content: assistant.content ?? "", thinking: assistant.thinking, tool_calls: toolCalls.length ? toolCalls : undefined });
+      toolTranscript.push({ role: "assistant", content: assistant.content ?? "", thinking: assistant.thinking, tool_calls: toolCalls.length ? toolCalls : undefined });
       if (!toolCalls.length) {
         agentPhase = "FINAL_SYNTHESIS";
         const content = assistant.content?.trim() ?? "";
         if (shouldContinueSafeBrowserNarration(latestMessage, content, narrationContinuations)) {
           narrationContinuations += 1;
-          agentMessages.push({
-            role: "system",
-            content: "You narrated a safe next browser step but did not execute it. Continue now with the appropriate browser tool and a fresh semantic ID. Do not infer confirmation for any write action.",
-          });
+          continuationReason = "NARRATED_SAFE_STEP";
           continue;
         }
         return plain(content || "KINO completed without a final response.");
@@ -260,7 +268,8 @@ export async function POST(request: Request) {
         } catch (error) {
           result = { success: false, status: "ACTION_FAILED", message: error instanceof Error ? error.message : "The tool failed." };
         }
-        agentMessages.push({ role: "tool", tool_name: toolName, content: JSON.stringify(result) });
+        toolTranscript.push({ role: "tool", tool_name: toolName, content: JSON.stringify(result) });
+        continuationReason = "TOOL_RESULT";
         const unwrapped = unwrapToolResult(result);
         if (toolName.startsWith("web_") && ["OPENED", "ACTION_COMPLETED", "AUTH_SUCCESS"].includes(String(unwrapped?.status ?? ""))) {
           browserActionCompleted = true;
@@ -268,7 +277,7 @@ export async function POST(request: Request) {
         const recoveryStatus = typeof unwrapped?.status === "string" ? unwrapped.status : "";
         if (toolName === "web_action" && ["STALE_ELEMENT", "NAVIGATION_UNVERIFIED"].includes(recoveryStatus)) {
           const refreshed = await executeKinoTool("web_observe", {}, context).catch(() => null);
-          if (refreshed) agentMessages.push({ role: "tool", tool_name: "web_observe", content: JSON.stringify(refreshed) });
+          if (refreshed) toolTranscript.push({ role: "tool", tool_name: "web_observe", content: JSON.stringify(refreshed) });
         }
         const stop = toolName.startsWith("web_") ? browserStopResponse(result) : null;
         if (stop) return plain(stop);

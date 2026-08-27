@@ -73,18 +73,23 @@ export async function ollamaHttpErrorDiagnostics(
   let ollamaErrorStatus: DiagnosticScalar | undefined;
   let ollamaErrorStatusCode: DiagnosticScalar | undefined;
   let ollamaErrorReason: DiagnosticScalar | undefined;
+  let transcriptInvalid = false;
   if (jsonContentType(upstreamContentType)) {
     const payload = await response.json().catch(() => null) as unknown;
     if (payload && typeof payload === "object" && !Array.isArray(payload) && "error" in payload) {
       if (typeof payload.error === "string") {
+        transcriptInvalid = /no user query found in messages/i.test(payload.error);
         ollamaError = redactSensitiveText(payload.error, sensitiveValues);
       } else if (payload.error && typeof payload.error === "object" && !Array.isArray(payload.error)) {
-        ollamaErrorMessage = safeDiagnosticScalar("message" in payload.error ? payload.error.message : undefined, sensitiveValues);
-        ollamaErrorCode = safeDiagnosticScalar("code" in payload.error ? payload.error.code : undefined, sensitiveValues);
-        ollamaErrorType = safeDiagnosticScalar("type" in payload.error ? payload.error.type : undefined, sensitiveValues);
-        ollamaErrorStatus = safeDiagnosticScalar("status" in payload.error ? payload.error.status : undefined, sensitiveValues);
-        ollamaErrorStatusCode = safeDiagnosticScalar("status_code" in payload.error ? payload.error.status_code : undefined, sensitiveValues);
-        ollamaErrorReason = safeDiagnosticScalar("reason" in payload.error ? payload.error.reason : undefined, sensitiveValues);
+        const errorObject = payload.error as Record<string, unknown>;
+        transcriptInvalid = ["message", "code", "type", "status", "status_code", "reason"].some((field) =>
+          typeof errorObject[field] === "string" && /no user query found in messages/i.test(errorObject[field]));
+        ollamaErrorMessage = safeDiagnosticScalar(errorObject.message, sensitiveValues);
+        ollamaErrorCode = safeDiagnosticScalar(errorObject.code, sensitiveValues);
+        ollamaErrorType = safeDiagnosticScalar(errorObject.type, sensitiveValues);
+        ollamaErrorStatus = safeDiagnosticScalar(errorObject.status, sensitiveValues);
+        ollamaErrorStatusCode = safeDiagnosticScalar(errorObject.status_code, sensitiveValues);
+        ollamaErrorReason = safeDiagnosticScalar(errorObject.reason, sensitiveValues);
       }
     }
   }
@@ -104,6 +109,7 @@ export async function ollamaHttpErrorDiagnostics(
     ollamaErrorStatus,
     ollamaErrorStatusCode,
     ollamaErrorReason,
+    modelErrorClassification: transcriptInvalid ? "MODEL_TRANSCRIPT_INVALID" as const : undefined,
     ...ollamaRequestDiagnostics(options.serializedRequest, options.messages, options.toolDefinitionCount, options.requestOptions),
   };
 }

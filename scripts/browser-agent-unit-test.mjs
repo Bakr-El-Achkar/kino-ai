@@ -10,12 +10,99 @@ import { developmentPrivateNetworkEscapeEnabled, isPrivateAddress, routedRequest
 import { requestedBrowserUrl } from "../lib/kino/browser-worker/routing.ts";
 import { shouldContinueSafeBrowserNarration } from "../lib/kino/browser-worker/continuation.ts";
 import { ollamaHttpErrorDiagnostics, ollamaRequestDiagnostics } from "../lib/kino/ollama/http-error-diagnostics.ts";
+import { buildQwenAgentTranscript, internalContinuationDirective, isInternalContinuationDirective, transcriptShape } from "../lib/kino/ollama/transcript.ts";
 import { isTransientAiTransportError, safeErrorDiagnostics, withTransientAiTransportRetry } from "../lib/kino/ollama/transport-retry.ts";
 import { formatBrowserToolResponse } from "../lib/kino/browser-worker/response.ts";
 import { buildCriticalConfirmationPhrase, parseActionConfirmation } from "../lib/kino/web-agent/action-confirmation.ts";
 
 const publicLookup = async () => [{ address: "93.184.216.34", family: 4 }];
 const privateLookup = async () => [{ address: "10.0.0.5", family: 4 }];
+
+const activeBrowserGoal = "Open website A, then open page B and tell me about it.";
+const visibleTranscript = [{ role: "user", content: activeBrowserGoal }];
+const toolHistory = [];
+const modelCallOne = buildQwenAgentTranscript({
+  systemMessage: "KINO system",
+  visibleConversation: visibleTranscript,
+  toolTranscript: toolHistory,
+  activeUserGoal: activeBrowserGoal,
+});
+assert.deepEqual(transcriptShape(modelCallOne, activeBrowserGoal), {
+  roles: ["system", "user"],
+  messageCount: 2,
+  activeUserGoalPresent: true,
+});
+
+toolHistory.push(
+  { role: "assistant", content: "", tool_calls: [{ function: { name: "web_open_url", arguments: {} } }] },
+  { role: "tool", tool_name: "web_open_url", content: JSON.stringify({ status: "OPENED", observation: "site A" }) },
+);
+const modelCallTwo = buildQwenAgentTranscript({
+  systemMessage: "KINO system",
+  visibleConversation: visibleTranscript,
+  toolTranscript: toolHistory,
+  activeUserGoal: activeBrowserGoal,
+  continuationReason: "TOOL_RESULT",
+});
+assert.deepEqual(transcriptShape(modelCallTwo, activeBrowserGoal), {
+  roles: ["system", "user", "assistant", "tool", "user"],
+  messageCount: 5,
+  activeUserGoalPresent: true,
+});
+assert.equal(isInternalContinuationDirective(modelCallTwo.at(-1)), true);
+assert.match(modelCallTwo.at(-1).content, /answer the user from the existing trusted results without another tool call/i);
+
+toolHistory.push(
+  { role: "assistant", content: "", tool_calls: [{ function: { name: "web_action", arguments: { elementId: "e7" } } }] },
+  { role: "tool", tool_name: "web_action", content: JSON.stringify({ status: "ACTION_COMPLETED", observation: "page B" }) },
+);
+const modelCallThree = buildQwenAgentTranscript({
+  systemMessage: "KINO system",
+  visibleConversation: visibleTranscript,
+  toolTranscript: toolHistory,
+  activeUserGoal: activeBrowserGoal,
+  continuationReason: "TOOL_RESULT",
+});
+assert.deepEqual(transcriptShape(modelCallThree, activeBrowserGoal), {
+  roles: ["system", "user", "assistant", "tool", "assistant", "tool", "user"],
+  messageCount: 7,
+  activeUserGoalPresent: true,
+});
+assert.equal(modelCallThree.at(-2).role, "tool");
+assert.match(modelCallThree.at(-2).content, /page B/);
+
+toolHistory.push(
+  { role: "assistant", content: "", tool_calls: [{ function: { name: "web_action", arguments: { elementId: "e11" } } }] },
+  { role: "tool", tool_name: "web_action", content: JSON.stringify({ status: "ACTION_COMPLETED", observation: "page C" }) },
+);
+const modelCallFour = buildQwenAgentTranscript({
+  systemMessage: "KINO system",
+  visibleConversation: visibleTranscript,
+  toolTranscript: toolHistory,
+  activeUserGoal: activeBrowserGoal,
+  continuationReason: "TOOL_RESULT",
+});
+assert.equal(transcriptShape(modelCallFour, activeBrowserGoal).activeUserGoalPresent, true);
+assert.deepEqual(modelCallFour.slice(-3).map((message) => message.role), ["assistant", "tool", "user"]);
+
+const internalDirective = internalContinuationDirective(activeBrowserGoal, "NARRATED_SAFE_STEP");
+assert.equal(parseActionConfirmation({ message: internalDirective.content, risk: "write" }).explicit, false);
+assert.match(internalDirective.content, /not user confirmation/i);
+assert.deepEqual(visibleTranscript, [{ role: "user", content: activeBrowserGoal }]);
+assert.equal(toolHistory.some(isInternalContinuationDirective), false);
+assert.equal(modelCallThree.filter(isInternalContinuationDirective).length, 1);
+assert.equal(toolHistory.filter((message) => message.role === "tool").length, 3);
+
+const ordinaryAiTranscript = buildQwenAgentTranscript({
+  systemMessage: "KINO system",
+  visibleConversation: [{ role: "user", content: "Explain photosynthesis." }],
+  toolTranscript: [],
+  activeUserGoal: "Explain photosynthesis.",
+});
+assert.deepEqual(ordinaryAiTranscript, [
+  { role: "system", content: "KINO system" },
+  { role: "user", content: "Explain photosynthesis." },
+]);
 
 const retrySignal = new AbortController().signal;
 const retryOptions = () => ({ signal: retrySignal, startedAt: Date.now(), maxRuntimeMs: 10_000, backoffMs: 0 });
@@ -127,6 +214,22 @@ assert.equal(objectHttpDiagnostics.ollamaErrorStatus, false);
 assert.equal(objectHttpDiagnostics.ollamaErrorStatusCode, 500);
 assert.equal(objectHttpDiagnostics.ollamaErrorReason, "input too large");
 assert.doesNotMatch(JSON.stringify(objectHttpDiagnostics), /UNKNOWN_FIELD_MUST_NOT_APPEAR|NESTED_PRIVATE_VALUE|unknown|details/);
+
+const invalidTranscriptDiagnostics = await ollamaHttpErrorDiagnostics(new Response(JSON.stringify({ error: {
+  code: 500,
+  message: "Jinja Exception: No user query found in messages.",
+  type: "server_error",
+} }), { status: 500, headers: { "Content-Type": "application/json" } }), {
+  serializedRequest: diagnosticRequest,
+  messages: [{ content: "diagnostic request" }],
+  toolDefinitionCount: 1,
+});
+assert.equal(invalidTranscriptDiagnostics.modelErrorClassification, "MODEL_TRANSCRIPT_INVALID");
+const invalidTranscriptError = Object.assign(new Error("The model rejected the internal transcript."), {
+  name: "ModelTranscriptInvalidError",
+  code: "MODEL_TRANSCRIPT_INVALID",
+});
+assert.equal(isTransientAiTransportError(invalidTranscriptError), false);
 
 const ignoredNestedScalars = await ollamaHttpErrorDiagnostics(new Response(JSON.stringify({ error: {
   message: { text: "hidden nested message" },
@@ -591,6 +694,7 @@ assert.doesNotMatch(toolSource, /getConnectedSite/);
 assert.doesNotMatch(toolSource, /\b(?:selector|xpath)\s*:/i);
 assert.doesNotMatch(toolSource, /username|password/);
 assert.match(toolSource, /\^e\\d\+\$/);
+assert.match(toolSource, /confirmBrowserAction\(context\.conversationId, context\.latestUserMessage\)/);
 
 const controllerSource = readFileSync("app/api/kino/route.ts", "utf8");
 assert.doesNotMatch(controllerSource, /playwright|browser-manager/);
@@ -604,6 +708,9 @@ assert.match(controllerSource, /KINO_AI_TRANSPORT_RETRY/);
 assert.match(controllerSource, /KINO_API_ERROR/);
 assert.match(controllerSource, /KINO_OLLAMA_HTTP_ERROR/);
 assert.match(controllerSource, /OllamaHttpError/);
+assert.match(controllerSource, /ModelTranscriptInvalidError/);
+assert.match(controllerSource, /buildQwenAgentTranscript/);
+assert.doesNotMatch(controllerSource, /agentMessages\.push\(\{\s*role: "system"/);
 assert.doesNotMatch(controllerSource, /console\.(?:log|warn|error)\([^\n]*(?:messages|serializedRequest|OLLAMA_API_KEY)/);
 const modelRetrySection = controllerSource.slice(
   controllerSource.indexOf("const assistant = await withTransientAiTransportRetry"),
