@@ -1,6 +1,7 @@
 "use client";
 
 import Image from "next/image";
+import type { ReasoningMode } from "@/lib/kino/ollama/inference";
 import {
   FormEvent,
   useCallback,
@@ -21,10 +22,6 @@ type KinoState =
   | "responding"
   | "online"
   | "error";
-
-type ReasoningMode =
-  | "fast"
-  | "deep";
 
 type LoginChallenge = {
   usernameLabel?: string;
@@ -90,7 +87,7 @@ export default function Home() {
     useState<KinoState>("ready");
 
   const [mode, setMode] =
-    useState<ReasoningMode>("fast");
+    useState<ReasoningMode>("normal");
 
   const [error, setError] =
     useState("");
@@ -133,7 +130,7 @@ export default function Home() {
     kinoState === "responding";
 
   const isDeepMode =
-    mode === "deep";
+    mode === "thinking";
 
   /*
     Automatically follow KINO's answer
@@ -384,8 +381,7 @@ export default function Home() {
             conversationId:
               conversationIdRef.current,
 
-            think:
-              mode === "deep",
+            reasoningMode: mode,
           }),
         });
 
@@ -750,14 +746,15 @@ export default function Home() {
           <button
             type="button"
             className={`header-mode-button ${
-              mode === "fast"
+              mode === "normal"
                 ? "header-mode-selected"
                 : ""
             }`}
             onClick={() =>
-              changeMode("fast")
+              changeMode("normal")
             }
             disabled={isBusy}
+            aria-pressed={mode === "normal"}
           >
             <span>⚡</span>
             FAST
@@ -766,14 +763,15 @@ export default function Home() {
           <button
             type="button"
             className={`header-mode-button ${
-              mode === "deep"
+              mode === "thinking"
                 ? "header-mode-selected header-deep-selected"
                 : ""
             }`}
             onClick={() =>
-              changeMode("deep")
+              changeMode("thinking")
             }
             disabled={isBusy}
+            aria-pressed={mode === "thinking"}
           >
             <span>◉</span>
             DEEP THINK
@@ -930,7 +928,7 @@ export default function Home() {
                   <div className="thinking-line">
                     <span>
                       {isDeepMode
-                        ? "Performing deep analysis"
+                        ? "Reasoning deeply..."
                         : "Processing"}
                     </span>
 

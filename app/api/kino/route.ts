@@ -1,3 +1,4 @@
+import { InferenceConfigurationError, parseReasoningMode, resolveInference } from "@/lib/kino/ollama/inference";
 import { observeBrowser, openBrowserUrl } from "@/lib/kino/browser-worker/client";
 import { formatBrowserToolResponse, unwrapToolResult } from "@/lib/kino/browser-worker/response";
 import { browserRuntimeStateMessage, requestedBrowserUrl } from "@/lib/kino/browser-worker/routing";
@@ -20,7 +21,6 @@ import {
 
 export const runtime = "nodejs";
 
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL ?? "kino-optimized";
 const OLLAMA_HOST = (process.env.OLLAMA_HOST ?? "http://localhost:11434").replace(/\/+$/, "");
 const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY?.trim();
 const MAX_BROWSER_STEPS = Math.min(25, Math.max(5, Number.parseInt(process.env.KINO_BROWSER_MAX_STEPS ?? "20", 10) || 20));
@@ -88,18 +88,18 @@ function browserStopResponse(toolResult: unknown) {
 async function callOllama(
   messages: OllamaTranscriptMessage[],
   tools: ReturnType<typeof getOllamaTools>,
-  deepMode: boolean,
+  inference: ReturnType<typeof resolveInference>,
   signal: AbortSignal,
   onStage: (stage: AiTransportStage) => void,
   onHttpError: (diagnostics: Awaited<ReturnType<typeof ollamaHttpErrorDiagnostics>>) => void,
 ) {
-  const requestOptions = { num_ctx: 8192, num_predict: 1024 };
+  const requestOptions = inference.options;
   const serializedRequest = JSON.stringify({
-    model: OLLAMA_MODEL,
+    model: inference.model,
     messages,
     tools,
     stream: false,
-    think: deepMode,
+    think: inference.think,
     keep_alive: -1,
     options: requestOptions,
   });
@@ -130,15 +130,23 @@ async function callOllama(
     throw httpError;
   }
   onStage("READING_BODY");
-  const result = (await response.json()) as OllamaResponse;
+  const result = (await response.json().catch((error: unknown) => {
+    // JSON parser errors may contain upstream text. Preserve only the transient EOF category.
+    if (error instanceof SyntaxError) {
+      throw new SyntaxError(/unexpected end of json input/i.test(error.message)
+        ? "Unexpected end of JSON input" : "Invalid model response JSON.");
+    }
+    throw error;
+  })) as OllamaResponse;
   onStage("VALIDATING_RESPONSE");
   if (result.error) {
-    const applicationError = new Error(result.error);
+    const applicationError = new Error("The model returned an application error.");
     applicationError.name = "OllamaApplicationError";
     throw applicationError;
   }
   if (!result.message) throw new Error("Ollama returned no assistant message.");
-  return result.message;
+  // Deliberately discard message.thinking before any transcript, tool, or UI handling.
+  return { content: result.message.content, tool_calls: result.message.tool_calls };
 }
 
 export async function POST(request: Request) {
@@ -149,6 +157,8 @@ export async function POST(request: Request) {
   let aiTransportStage: AiTransportStage = "NOT_STARTED";
   try {
     const body = (await request.json()) as Record<string, unknown>;
+    const reasoningMode = parseReasoningMode(body.reasoningMode);
+    const inference = resolveInference(reasoningMode);
     const incoming = body.messages;
     if (!Array.isArray(incoming) || incoming.length === 0) {
       return Response.json({ error: "No conversation messages were provided." }, { status: 400 });
@@ -175,7 +185,7 @@ export async function POST(request: Request) {
     }
 
     const systemMessage = `${KINO_SYSTEM_PROMPT}\n\n${browserRuntimeStateMessage()}`;
-    const visibleConversation = messages.map((message) => ({ ...message }));
+    const visibleConversation = messages.map(({ role, content }) => ({ role, content }));
     const toolTranscript: OllamaTranscriptMessage[] = [];
     const tools = getOllamaTools();
     const startedAt = requestStartedAt;
@@ -203,11 +213,19 @@ export async function POST(request: Request) {
           return callOllama(
             requestMessages,
             tools,
-            body.think === true,
+            inference,
             request.signal,
             (stage) => { aiTransportStage = stage; },
             (diagnostics) => console.error("KINO_OLLAMA_HTTP_ERROR", {
-              ...diagnostics,
+              // Never log free-form upstream error text or headers.
+              upstreamStatus: diagnostics.upstreamStatus,
+              modelErrorClassification: diagnostics.modelErrorClassification,
+              requestBytes: diagnostics.requestBytes,
+              messageCount: diagnostics.messageCount,
+              toolDefinitionCount: diagnostics.toolDefinitionCount,
+              configuredNumCtx: diagnostics.configuredNumCtx,
+              configuredNumPredict: diagnostics.configuredNumPredict,
+              reasoningMode,
               agentPhase,
               agentStep,
               browserActionCompleted,
@@ -232,7 +250,7 @@ export async function POST(request: Request) {
         },
       );
       const toolCalls = assistant.tool_calls ?? [];
-      toolTranscript.push({ role: "assistant", content: assistant.content ?? "", thinking: assistant.thinking, tool_calls: toolCalls.length ? toolCalls : undefined });
+      toolTranscript.push({ role: "assistant", content: assistant.content ?? "", tool_calls: toolCalls.length ? toolCalls : undefined });
       if (!toolCalls.length) {
         agentPhase = "FINAL_SYNTHESIS";
         const content = assistant.content?.trim() ?? "";
@@ -285,6 +303,11 @@ export async function POST(request: Request) {
     }
     return plain(`KINO reached the configured maximum of ${MAX_BROWSER_STEPS} browser steps without completing the goal.`);
   } catch (error) {
+    if (error instanceof InferenceConfigurationError) {
+      return Response.json({ error: error.message, code: error.code }, {
+        status: error.code === "INVALID_REASONING_MODE" ? 400 : 503,
+      });
+    }
     if (error instanceof Error && error.name === "AbortError") return plain("KINO request cancelled.", 499);
     console.error("KINO_API_ERROR", {
       ...safeErrorDiagnostics(error),

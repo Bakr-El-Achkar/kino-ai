@@ -136,3 +136,52 @@ You can check out [the Next.js GitHub repository](https://github.com/vercel/next
 The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
 
 Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+
+
+### Thinking mode
+
+The existing FAST / DEEP THINK controls select a per-page mode (FAST by default).
+The choice stays selected between messages and cannot change during a request.
+DEEP THINK shows ?Reasoning deeply...? while waiting; only the final answer is displayed.
+
+`POST /api/kino` accepts `reasoningMode: "normal" | "thinking"` alongside
+`messages` and `conversationId`. Omission means `normal`. Invalid values return
+HTTP 400 with code `INVALID_REASONING_MODE`. Client model names and the legacy
+`think` flag do not select inference settings.
+
+Server-only Vercel environment variables for enabling Thinking mode:
+
+```dotenv
+OLLAMA_THINKING_MODEL=kino-8b-thinking
+KINO_THINK_NUM_CTX=8192
+KINO_THINK_NUM_PREDICT=2048
+```
+
+The budget variables are optional; these are their defaults. The reasoning model
+must already be installed and support thinking and tools on the existing Ollama
+endpoint. Missing/blank `OLLAMA_THINKING_MODEL` returns HTTP 503 with code
+`THINKING_MODEL_NOT_CONFIGURED`, before tools run. Upstream model failures do not
+fall back to normal inference and deterministic HTTP/application errors are not retried.
+
+Normal mode continues to select `OLLAMA_MODEL` (existing fallback:
+`kino-optimized`), sends top-level `think: false`, and defaults to 8192 context /
+1024 output tokens. `KINO_NUM_CTX` and `KINO_NUM_PREDICT` now honor the overrides
+previously documented above but ignored by the route. Positive integer overrides
+are supported; invalid budgets use defaults. Leave normal environment settings
+unchanged to retain current defaults. Thinking mode selects only
+`OLLAMA_THINKING_MODEL`, sends top-level `think: true`, and uses its own budgets
+for every model round, including tool continuations and retries.
+
+The route discards Ollama `message.thinking` immediately. Only `message.content`
+and `message.tool_calls` proceed to the agent loop. Raw thinking is neither
+returned nor added to visible history, tool transcripts, or logs. HTTP logs use
+numeric request metadata and fixed classifications, never upstream error text.
+The Qwen ephemeral continuation directive and actual-user confirmation context
+remain unchanged. Thinking grants no extra authorization. Direct URL shortcuts,
+secure login, Live Browser, browser safety limits, and worker protections remain
+unchanged. No infrastructure or model installation is performed by this change.
+
+`npm run test:thinking-mode` runs mocked inference/route integration tests without
+Ollama or a GPU; `npm test` includes these and the existing browser/security suites.
+Live model quality, latency, tool support, and hosting timeouts still need a
+production-model benchmark. Existing per-request runtime limits remain in effect.

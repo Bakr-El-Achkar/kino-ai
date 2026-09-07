@@ -2,7 +2,7 @@ export type OllamaToolCall = { type?: "function"; function: { name: string; argu
 
 export type OllamaTranscriptMessage =
   | { role: "system" | "user"; content: string }
-  | { role: "assistant"; content: string; thinking?: string; tool_calls?: OllamaToolCall[] }
+  | { role: "assistant"; content: string; tool_calls?: OllamaToolCall[] }
   | { role: "tool"; tool_name: string; content: string };
 
 export type VisibleConversationMessage = { role: "user" | "assistant"; content: string };
