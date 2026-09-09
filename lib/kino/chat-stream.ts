@@ -1,4 +1,7 @@
+import { parseActivity, type Activity } from "./activity.ts";
+
 export type ChatStreamEvent =
+  | ({ type: "status" } & Activity)
   | { type: "start" }
   | { type: "delta"; content: string }
   | { type: "reset" }
@@ -57,6 +60,7 @@ export async function consumeChatStream(
   onDelta: (content: string) => void,
   signal?: AbortSignal,
   onReset: () => void = () => {},
+  onStatus: (activity: Activity) => void = () => {},
 ) {
   let started = false;
   for await (const value of readNdjson(body, signal)) {
@@ -64,6 +68,12 @@ export async function consumeChatStream(
     const event = value as Record<string, unknown>;
     if (event.type === "start" && !started) { started = true; continue; }
     if (!started) throw new Error("Invalid chat stream.");
+    if (event.type === "status") {
+      const activity = parseActivity(event);
+      if (!activity) throw new Error("Invalid activity status.");
+      onStatus(activity);
+      continue;
+    }
     if (event.type === "delta" && typeof event.content === "string") { onDelta(event.content); continue; }
     if (event.type === "reset") { onReset(); continue; }
     if (event.type === "done") return;

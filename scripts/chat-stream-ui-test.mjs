@@ -35,8 +35,16 @@ try {
   await emit({ type: 'start' });
   assert.match(await page.locator('.chat-working').textContent(), /Reasoning deeply/);
   assert.equal(await page.locator('.chat-row-kino').count(), 0);
+  await emit({ type: 'status', kind: 'browser', label: 'Opening tailscale.com' });
+  await page.getByRole('status').filter({ hasText: 'Opening tailscale.com' }).waitFor();
+  await emit({ type: 'status', kind: 'reading', label: 'Reading tailscale.com' });
+  await page.getByRole('status').filter({ hasText: 'Reading tailscale.com' }).waitFor();
+  assert.equal(await page.locator('.chat-working').count(), 1);
+  assert.equal(await page.getByText('Opening tailscale.com', { exact: true }).count(), 0);
   await emit({ type: 'delta', content: '**Hel' });
   await page.locator('.chat-markdown').filter({ hasText: 'Hel' }).waitFor();
+  assert.equal(await page.locator('.chat-working').count(), 0);
+  await emit({ type: 'status', kind: 'reading', label: 'Reading page...' });
   assert.equal(await page.locator('.chat-working').count(), 0);
   assert.equal(await page.locator('.chat-row-kino').count(), 1);
   await emit({ type: 'delta', content: 'lo**\n\n```javascript\nconsole.' });

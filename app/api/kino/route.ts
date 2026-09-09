@@ -1,3 +1,5 @@
+import { reasoningActivity, responseActivity, confirmationActivity, verificationActivity } from "@/lib/kino/activity";
+import { safeToolActivity } from "@/lib/kino/activity-server";
 import { InferenceConfigurationError, parseReasoningMode, resolveInference } from "@/lib/kino/ollama/inference";
 import { CHAT_STREAM_HEADERS, encodeChatEvent, type ChatStreamEvent } from "@/lib/kino/chat-stream";
 import { readOllamaRound, streamChatResponse } from "@/lib/kino/ollama/final-stream";
@@ -170,8 +172,12 @@ export async function POST(request: Request) {
 
     const directUrl = requestedBrowserUrl(latestMessage);
     if (directUrl && directOpenRequest(latestMessage, directUrl)) {
-      const result = await openBrowserUrl(context.conversationId, directUrl);
-      return plain(formatBrowserToolResponse(result));
+      return streamChatResponse(request.signal, MAX_RUNTIME_MS - (Date.now() - requestStartedAt), async (publish) => {
+        publish({ type: "status", ...await safeToolActivity("web_open_url", { url: directUrl }) });
+        const result = await openBrowserUrl(context.conversationId, directUrl);
+        publish({ type: "status", ...responseActivity });
+        publish({ type: "delta", content: formatBrowserToolResponse(result) });
+      });
     }
 
     const systemMessage = `${KINO_SYSTEM_PROMPT}\n\n${browserRuntimeStateMessage()}`;
@@ -186,8 +192,16 @@ export async function POST(request: Request) {
 
     return streamChatResponse(request.signal, MAX_RUNTIME_MS - (Date.now() - startedAt), async (send, signal) => {
       let visiblePublished = false;
+      let roundVisible = false;
+      let pageUrl: unknown;
+      let previousTool = "";
       const publish = (event: ChatStreamEvent) => {
-        if (event.type === "delta" && event.content) visiblePublished = true;
+        if (event.type === "reset") roundVisible = false;
+        if (event.type === "delta" && event.content) {
+          if (!roundVisible) send({ type: "status", ...responseActivity });
+          roundVisible = true;
+          visiblePublished = true;
+        }
         send(event);
       };
       const finish = (content: string) => { publish({ type: "delta", content }); };
@@ -202,6 +216,7 @@ export async function POST(request: Request) {
           activeUserGoal: latestMessage,
           continuationReason: round === 1 ? undefined : continuationReason,
         });
+        publish({ type: "status", ...reasoningActivity(inference.think) });
         let aiRequestAttempt = 0;
         const assistant = await withTransientAiTransportRetry(
           () => {
@@ -285,6 +300,8 @@ export async function POST(request: Request) {
               }
             }
           }
+          publish({ type: "status", ...await safeToolActivity(toolName, args, pageUrl, previousTool === "web_observe") });
+          previousTool = toolName;
           let result: unknown;
           try {
             result = await executeKinoTool(toolName, args, context);
@@ -294,16 +311,22 @@ export async function POST(request: Request) {
           toolTranscript.push({ role: "tool", tool_name: toolName, content: JSON.stringify(result) });
           continuationReason = "TOOL_RESULT";
           const unwrapped = unwrapToolResult(result);
+          const observation = unwrapped?.observation;
+          if (observation && typeof observation === "object" && "url" in observation) pageUrl = observation.url;
           if (toolName.startsWith("web_") && ["OPENED", "ACTION_COMPLETED", "AUTH_SUCCESS"].includes(String(unwrapped?.status ?? ""))) {
             browserActionCompleted = true;
           }
           const recoveryStatus = typeof unwrapped?.status === "string" ? unwrapped.status : "";
           if (toolName === "web_action" && ["STALE_ELEMENT", "NAVIGATION_UNVERIFIED"].includes(recoveryStatus)) {
+            publish({ type: "status", ...verificationActivity });
             const refreshed = await executeKinoTool("web_observe", {}, context).catch(() => null);
             if (refreshed) toolTranscript.push({ role: "tool", tool_name: "web_observe", content: JSON.stringify(refreshed) });
           }
           const stop = toolName.startsWith("web_") ? browserStopResponse(result) : null;
-          if (stop) return finish(stop);
+          if (stop) {
+            if (unwrapped?.status === "ACTION_NEEDS_CONFIRMATION") publish({ type: "status", ...confirmationActivity });
+            return finish(stop);
+          }
         }
       }
       return finish(`KINO reached the configured maximum of ${MAX_BROWSER_STEPS} browser steps without completing the goal.`);

@@ -1,6 +1,8 @@
 "use client";
 
 import Image from "next/image";
+import { reasoningActivity, type Activity } from "@/lib/kino/activity";
+import { ActivityIndicator } from "@/components/chat/ActivityIndicator";
 import { consumeChatStream } from "@/lib/kino/chat-stream";
 import { MarkdownMessage, CopyButton } from "@/components/chat/MarkdownMessage";
 import type { ReasoningMode } from "@/lib/kino/ollama/inference";
@@ -74,6 +76,8 @@ export default function Home() {
 
   const [mode, setMode] =
     useState<ReasoningMode>("normal");
+
+  const [activity, setActivity] = useState<Activity | null>(null);
 
   const [error, setError] =
     useState("");
@@ -328,6 +332,7 @@ export default function Home() {
     followOutputRef.current = true;
     setInput("");
     setError("");
+    setActivity(reasoningActivity(isDeepMode));
     setKinoState("thinking");
 
     const userMessage: Message = {
@@ -458,6 +463,7 @@ export default function Home() {
       try {
         await consumeChatStream(response.body, (delta) => {
           if (!delta) return;
+          setActivity(null);
           if (!answerStarted) {
             answerStarted = true;
             setKinoState("responding");
@@ -471,7 +477,10 @@ export default function Home() {
           accumulatedText = "";
           answerStarted = false;
           renderAccumulatedText();
+          setActivity(reasoningActivity(isDeepMode));
           setKinoState("thinking");
+        }, (nextActivity) => {
+          if (!answerStarted) setActivity(nextActivity);
         });
       } finally {
         // Flush even on disconnect: keep every received delta and cancel stale paint callbacks.
@@ -536,6 +545,7 @@ export default function Home() {
 
       setKinoState("error");
     } finally {
+      setActivity(null);
       if (activeRequestRef.current === requestController) activeRequestRef.current = null;
       if (!requestController.signal.aborted) {
         setTimeout(() => { inputRef.current?.focus(); }, 100);
@@ -868,10 +878,7 @@ export default function Home() {
               final answer starts */}
 
           {kinoState === "thinking" && (
-            <div className="chat-working" role="status">
-              <span className="send-loader" />
-              {isDeepMode ? "Reasoning deeply..." : "Working..."}
-            </div>
+            <ActivityIndicator activity={activity ?? reasoningActivity(isDeepMode)} />
           )}
 
           {error && (

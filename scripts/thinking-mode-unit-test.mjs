@@ -1,6 +1,7 @@
 ﻿import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import ts from 'typescript';
+import * as activity from '../lib/kino/activity.ts';
 import * as chatStream from '../lib/kino/chat-stream.ts';
 import * as finalStream from '../lib/kino/ollama/final-stream.ts';
 import * as inference from '../lib/kino/ollama/inference.ts';
@@ -31,8 +32,11 @@ assert.throws(() => inference.resolveInference('thinking', {}), { code: 'THINKIN
 
 // Execute the actual route with deterministic model/worker boundaries and the real
 // transcript, transport retry, response formatting, and continuation implementations.
-let actions = [], requests = [], queue = [], logs = [];
+let actions = [], requests = [], queue = [], logs = [], statuses = [];
+let directUrlFixture = null;
 const modules = {
+  '@/lib/kino/activity': activity,
+  '@/lib/kino/activity-server': { safeToolActivity: async (...args) => activity.toolActivity(...args) },
   '@/lib/kino/chat-stream': chatStream,
   '@/lib/kino/ollama/final-stream': finalStream,
   '@/lib/kino/ollama/inference': inference,
@@ -41,14 +45,15 @@ const modules = {
   '@/lib/kino/ollama/http-error-diagnostics': diagnostics,
   '@/lib/kino/browser-worker/response': responseHelpers,
   '@/lib/kino/browser-worker/continuation': continuation,
-  '@/lib/kino/browser-worker/routing': { requestedBrowserUrl: () => null, browserRuntimeStateMessage: () => 'fixture' },
-  '@/lib/kino/browser-worker/client': { observeBrowser: async () => ({ observation: { status: 'AUTH_REQUIRED' } }), openBrowserUrl: async () => { throw Error('unexpected direct open'); } },
+  '@/lib/kino/browser-worker/routing': { requestedBrowserUrl: () => directUrlFixture, browserRuntimeStateMessage: () => 'fixture' },
+  '@/lib/kino/browser-worker/client': { observeBrowser: async () => ({ observation: { status: 'AUTH_REQUIRED' } }), openBrowserUrl: async (_id, url) => { actions.push({ name: 'direct-open', url }); return { status: 'OPENED', message: 'Opened fixture' }; } },
   '@/lib/kino/tools': {
     getOllamaTools: () => [{ type: 'function', function: { name: 'web_action' } }],
     latestActualUserMessage: messages => messages.findLast(m => m.role === 'user')?.content ?? '',
     createChatToolContext: args => args,
     executeKinoTool: async (name, args, context) => {
       actions.push({ name, args, context });
+      if (args.action === 'needs_confirmation') return { status: 'ACTION_NEEDS_CONFIRMATION', message: 'Confirmation required' };
       if (args.action === 'confirm_pending') return { status: parseActionConfirmation({ message: context.latestUserMessage, risk: 'write' }).explicit ? 'ACTION_COMPLETED' : 'CONFIRMATION_REJECTED' };
       return { status: 'ACTION_COMPLETED', message: `trusted result ${actions.length}` };
     },
@@ -73,6 +78,11 @@ async function run(body, replies) {
   const events = result.headers.get('content-type')?.includes('ndjson')
     ? wire.trim().split('\n').map(line => JSON.parse(line)) : [];
   let text = events.length ? '' : wire;
+  statuses = events.filter(event => event.type === 'status');
+  assert.ok(statuses.every(event => activity.parseActivity(event)), 'Unsafe activity event');
+  if (!actions.length && replies.length === 1 && !Array.isArray(replies[0]) && replies[0]?.message?.content) {
+    assert.ok(statuses.every(event => ['reasoning', 'response'].includes(event.kind)), 'Simple chat claimed browser activity');
+  }
   for (const event of events) {
     if (event.type === 'reset') text = '';
     if (event.type === 'delta') text += event.content;
@@ -105,6 +115,23 @@ try {
   assert.equal(requests[0].model, env.OLLAMA_MODEL);
   assert.equal(requests[0].think, false);
   assert.deepEqual(requests[0].options, { num_ctx: 8192, num_predict: 1024 });
+  await run({}, [[
+    { type: 'status', kind: 'reasoning', label: secret, tool_calls: [tool(0)] },
+    { message: { thinking: secret, content: 'Safe answer' }, done: true },
+  ]]);
+  assert.equal(actions.length, 0, 'Upstream status triggered a tool');
+  assert.deepEqual(statuses.map(event => event.label), ['Working...', 'Preparing response...']);
+  directUrlFixture = 'https://tailscale.com/docs?token=STATUS_SECRET#private';
+  await run({ messages: [{ role: 'user', content: `Open ${directUrlFixture}` }] }, []);
+  assert.equal(requests.length, 0, 'Status introduced model inference');
+  assert.equal(actions.length, 1, 'Status changed direct-open execution');
+  assert.equal(statuses[0].label, 'Opening tailscale.com');
+  assert.ok(!JSON.stringify(statuses).includes('STATUS_SECRET'));
+  directUrlFixture = null;
+  await run({}, [tool(0, { action: 'needs_confirmation' })]);
+  assert.ok(statuses.some(event => event.kind === 'confirmation' && event.label === 'Waiting for confirmation...'));
+  assert.equal(actions.length, 1);
+  assert.equal(requests.length, 1, 'Confirmation status continued execution');
   for (const reasoningMode of ['normal', 'thinking']) {
     let upstream;
     actions = []; requests = []; logs = [];
@@ -112,7 +139,12 @@ try {
     const response = await exports.POST(new Request('http://localhost/api/kino', {
       method: 'POST', body: JSON.stringify({ reasoningMode, messages: [{ role: 'user', content: 'Say hello' }] }),
     }));
-    const reader = chatStream.readNdjson(response.body)[Symbol.asyncIterator]();
+    const rawReader = chatStream.readNdjson(response.body)[Symbol.asyncIterator]();
+    const reader = { async next() {
+      let item;
+      do { item = await rawReader.next(); } while (!item.done && item.value.type === 'status');
+      return item;
+    } };
     assert.deepEqual((await reader.next()).value, { type: 'start' });
     upstream.enqueue(new TextEncoder().encode(JSON.stringify({ message: { thinking: secret } }) + '\n'));
     upstream.enqueue(new TextEncoder().encode(JSON.stringify({ message: { content: 'Hello ' } }) + '\n'));
@@ -232,7 +264,8 @@ try {
 const page = readFileSync('app/page.tsx', 'utf8');
 assert.match(page, /useState<ReasoningMode>\("normal"\)/);
 assert.match(page, /reasoningMode: mode/);
-assert.match(page, /Reasoning deeply/);
+assert.match(page, /reasoningActivity/);
+assert.equal(activity.reasoningActivity(true).label, 'Reasoning deeply...');
 assert.doesNotMatch(page, /OLLAMA_THINKING_MODEL|message\.thinking/);
 assert.match(page, /if \(isBusy\) \{\s+return;/);
 console.log('Thinking mode inference and route integration tests passed.');

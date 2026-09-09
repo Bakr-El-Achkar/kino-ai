@@ -2716,6 +2716,10 @@ footer span:last-child {
 .chat-markdown th, .chat-markdown td { border: 1px solid #29404b; padding: 9px 12px; text-align: left; min-width: 110px; }
 .chat-markdown th { background: #102029; font-weight: 600; }
 .chat-working { display: flex; align-items: center; gap: 10px; padding-left: 43px; color: #8faab7; font-size: 14px; }
+.activity-icon { width: 22px; height: 22px; flex: 0 0 auto; display: grid; place-items: center; border: 1px solid #294651; border-radius: 50%; color: #90c9db; animation: activityPulse 1.6s ease-in-out infinite; }
+.chat-working > span:last-child { min-width: 0; overflow-wrap: anywhere; }
+@keyframes activityPulse { 50% { opacity: .45; } }
+@media (prefers-reduced-motion: reduce) { .activity-icon { animation: none; } }
 .chat-empty { margin: auto 0; padding: 48px 0; text-align: center; }
 .chat-empty .message-avatar { margin: 0 auto 20px; width: 44px; height: 44px; font-size: 16px; }
 .chat-empty h1 { font-size: 28px; font-weight: 500; margin-bottom: 12px; }
