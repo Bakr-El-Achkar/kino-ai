@@ -1,6 +1,8 @@
 "use client";
 
 import Image from "next/image";
+import { consumeChatStream } from "@/lib/kino/chat-stream";
+import { MarkdownMessage, CopyButton } from "@/components/chat/MarkdownMessage";
 import type { ReasoningMode } from "@/lib/kino/ollama/inference";
 import {
   FormEvent,
@@ -53,22 +55,6 @@ function browserHostname(url?: string) {
   }
 }
 
-function renderMessageContent(content: string) {
-  return content.split(/(https?:\/\/[^\s<]+)/g).map((part, index) => {
-    if (!/^https?:\/\//i.test(part)) return part;
-    const url = part.replace(/[.,!?;:)}\]]+$/, "");
-    const trailing = part.slice(url.length);
-    return (
-      <span key={`${url}-${index}`}>
-        <a href={url} target="_blank" rel="noopener noreferrer">
-          {url}
-        </a>
-        {trailing}
-      </span>
-    );
-  });
-}
-
 export default function Home() {
   const [input, setInput] =
     useState("");
@@ -111,8 +97,26 @@ export default function Home() {
     setStreamingMessageId,
   ] = useState<string | null>(null);
 
+  const activeRequestRef = useRef<AbortController | null>(null);
+  useEffect(() => {
+    const abort = () => activeRequestRef.current?.abort();
+    window.addEventListener("pagehide", abort);
+    return () => { abort(); window.removeEventListener("pagehide", abort); };
+  }, []);
+
   const inputRef =
-    useRef<HTMLInputElement>(null);
+    useRef<HTMLTextAreaElement>(null);
+
+  const followOutputRef = useRef(true);
+  const touchYRef = useRef(0);
+  const scrollRef = useRef<HTMLElement>(null);
+
+  useEffect(() => {
+    const textarea = inputRef.current;
+    if (!textarea) return;
+    textarea.style.height = "auto";
+    textarea.style.height = `${Math.min(textarea.scrollHeight, 180)}px`;
+  }, [input]);
 
   const chatEndRef =
     useRef<HTMLDivElement>(null);
@@ -138,7 +142,9 @@ export default function Home() {
   */
 
   useEffect(() => {
+    if (!followOutputRef.current) return;
     chatEndRef.current?.scrollIntoView({
+      block: "end",
       behavior:
         streamingMessageId
           ? "auto"
@@ -299,7 +305,7 @@ export default function Home() {
     const command =
       input.trim();
 
-    if (!command || isBusy) {
+    if (!command || isBusy || activeRequestRef.current) {
       return;
     }
 
@@ -319,6 +325,7 @@ export default function Home() {
       return;
     }
 
+    followOutputRef.current = true;
     setInput("");
     setError("");
     setKinoState("thinking");
@@ -342,6 +349,8 @@ export default function Home() {
       conversationWithUser
     );
 
+    const requestController = new AbortController();
+    activeRequestRef.current = requestController;
     try {
       conversationIdRef.current ??=
         crypto.randomUUID();
@@ -369,6 +378,7 @@ export default function Home() {
       const response =
         await fetch("/api/kino", {
           method: "POST",
+          signal: requestController.signal,
 
           headers: {
             "Content-Type":
@@ -437,113 +447,38 @@ export default function Home() {
         kinoMessageId
       );
 
-      /*
-        Read KINO's response stream.
-      */
-
-      const reader =
-        response.body.getReader();
-
-      const decoder =
-        new TextDecoder();
-
       let accumulatedText = "";
-
       let answerStarted = false;
-
-      let pendingMessageFrame:
-        number | null = null;
-
+      let pendingMessageFrame: number | null = null;
       const renderAccumulatedText = () => {
         pendingMessageFrame = null;
-
-        setMessages((current) =>
-          current.map((message) =>
-            message.id ===
-            kinoMessageId
-              ? {
-                  ...message,
-                  content:
-                    accumulatedText,
-                }
-              : message
-          )
-        );
+        setMessages(current => current.map(message => message.id === kinoMessageId
+          ? { ...message, content: accumulatedText } : message));
       };
-
-      while (true) {
-        const { done, value } =
-          await reader.read();
-
-        if (done) {
-          break;
-        }
-
-        const chunk =
-          decoder.decode(
-            value,
-            {
-              stream: true,
-            }
-          );
-
-        if (!chunk) {
-          continue;
-        }
-
-        /*
-          KINO has finished hidden reasoning
-          and has started producing the
-          visible final answer.
-        */
-
-        if (!answerStarted) {
-          answerStarted = true;
-
-          setKinoState(
-            "responding"
-          );
-        }
-
-        accumulatedText +=
-          chunk;
-
-        /*
-          Batch visible token updates to the
-          browser's next paint. This preserves
-          every token while avoiding a React
-          render for every network chunk.
-        */
-
-        if (
-          pendingMessageFrame ===
-          null
-        ) {
-          pendingMessageFrame =
-            requestAnimationFrame(
-              renderAccumulatedText
-            );
-        }
+      try {
+        await consumeChatStream(response.body, (delta) => {
+          if (!delta) return;
+          if (!answerStarted) {
+            answerStarted = true;
+            setKinoState("responding");
+          }
+          accumulatedText += delta;
+          if (pendingMessageFrame === null) {
+            pendingMessageFrame = requestAnimationFrame(renderAccumulatedText);
+          }
+        }, requestController.signal, () => {
+          if (pendingMessageFrame !== null) cancelAnimationFrame(pendingMessageFrame);
+          accumulatedText = "";
+          answerStarted = false;
+          renderAccumulatedText();
+          setKinoState("thinking");
+        });
+      } finally {
+        // Flush even on disconnect: keep every received delta and cancel stale paint callbacks.
+        if (pendingMessageFrame !== null) cancelAnimationFrame(pendingMessageFrame);
+        renderAccumulatedText();
+        if (!accumulatedText) setMessages(current => current.filter(message => message.id !== kinoMessageId));
       }
-
-      const trailingText =
-        decoder.decode();
-
-      if (trailingText) {
-        accumulatedText +=
-          trailingText;
-      }
-
-      if (
-        pendingMessageFrame !==
-        null
-      ) {
-        cancelAnimationFrame(
-          pendingMessageFrame
-        );
-      }
-
-      renderAccumulatedText();
 
       /*
         Stream finished.
@@ -581,6 +516,11 @@ export default function Home() {
 
       setKinoState("online");
     } catch (err) {
+      if (requestController.signal.aborted) {
+        setStreamingMessageId(null);
+        setKinoState("ready");
+        return;
+      }
       console.error(err);
 
       setStreamingMessageId(
@@ -596,9 +536,10 @@ export default function Home() {
 
       setKinoState("error");
     } finally {
-      setTimeout(() => {
-        inputRef.current?.focus();
-      }, 100);
+      if (activeRequestRef.current === requestController) activeRequestRef.current = null;
+      if (!requestController.signal.aborted) {
+        setTimeout(() => { inputRef.current?.focus(); }, 100);
+      }
     }
   }
 
@@ -784,9 +725,28 @@ export default function Home() {
       ============================== */}
 
       <div className={`kino-workspace-shell ${showBrowserPanel ? "has-live-browser" : ""} ${browserCollapsed ? "browser-is-collapsed" : ""}`}>
-      <section className="chat-workspace">
+      <section className="chat-workspace" ref={scrollRef} aria-label="Conversation" tabIndex={0}
+      onWheel={(event) => { if (event.deltaY < 0) followOutputRef.current = false; }}
+      onTouchStart={(event) => { touchYRef.current = event.touches[0].clientY; }}
+      onTouchMove={(event) => {
+        if (event.touches[0].clientY > touchYRef.current) followOutputRef.current = false;
+        touchYRef.current = event.touches[0].clientY;
+      }}
+      onPointerDown={() => { followOutputRef.current = false; }}
+      onKeyDown={(event) => {
+        if (["ArrowUp", "PageUp", "Home"].includes(event.key)) followOutputRef.current = false;
+      }}
+      onScroll={() => {
+        const el = scrollRef.current;
+        if (!el) return;
+        const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 140;
+        if (nearBottom) followOutputRef.current = true;
+      }}>
         <div className="chat-inner">
-          {messages.map(
+          {(messages.length === 0 || (messages.length === 1 && messages[0].id === "kino-welcome")) && (
+            <div className="chat-empty"><div className="message-avatar kino-avatar">K</div><h1>How can I help?</h1><p>Your AI operations system. Ask, explore, or put KINO to work.</p></div>
+          )}
+          {messages.filter((message) => message.id !== "kino-welcome" && message.content).map(
             (message) => {
               const isUser =
                 message.role ===
@@ -841,7 +801,7 @@ export default function Home() {
                           : ""
                       }`}
                     >
-                      {renderMessageContent(message.content)}
+                      {isUser ? message.content : <MarkdownMessage content={message.content} />}
 
                       {isStreaming && (
                         <span className="typing-cursor">
@@ -849,6 +809,7 @@ export default function Home() {
                         </span>
                       )}
                     </div>
+                    {!isUser && message.content && !isStreaming && <CopyButton text={message.content} label="Copy response" />}
                   </div>
 
                   {isUser && (
@@ -906,47 +867,17 @@ export default function Home() {
           {/* Show this only BEFORE
               final answer starts */}
 
-          {kinoState ===
-            "thinking" && (
-            <div className="chat-row chat-row-kino">
-              <div className="message-avatar kino-avatar active-avatar">
-                K
-              </div>
-
-              <div className="message-group message-group-kino">
-                <div className="message-meta">
-                  KINO
-                </div>
-
-                <div
-                  className={`message-bubble kino-bubble thinking-bubble ${
-                    isDeepMode
-                      ? "deep-thinking-bubble"
-                      : ""
-                  }`}
-                >
-                  <div className="thinking-line">
-                    <span>
-                      {isDeepMode
-                        ? "Reasoning deeply..."
-                        : "Processing"}
-                    </span>
-
-                    <div className="chat-thinking-dots">
-                      <i />
-                      <i />
-                      <i />
-                    </div>
-                  </div>
-                </div>
-              </div>
+          {kinoState === "thinking" && (
+            <div className="chat-working" role="status">
+              <span className="send-loader" />
+              {isDeepMode ? "Reasoning deeply..." : "Working..."}
             </div>
           )}
 
           {error && (
-            <div className="chat-error">
+            <div className="chat-error" role="alert">
               <span>
-                CORE ERROR
+                Response interrupted
               </span>
 
               {error}
@@ -1049,19 +980,25 @@ export default function Home() {
           onSubmit={sendMessage}
         >
           <div className="command-top">
-            <span className="command-mode">
-              {isDeepMode
-                ? "◉ DEEP REASONING"
-                : "⚡ FAST RESPONSE"}
-            </span>
-
+            <div className="composer-modes" role="group" aria-label="Response mode">
+              <button type="button" aria-pressed={mode === "normal"} disabled={isBusy} onClick={() => changeMode("normal")}>FAST</button>
+              <button type="button" aria-pressed={mode === "thinking"} disabled={isBusy} onClick={() => changeMode("thinking")}>THINK</button>
+            </div>
             <span className="command-status">
               PRIVATE WORKER · SECURE SESSION
             </span>
           </div>
 
           <div className="command-input-row">
-            <input
+            <textarea
+              rows={1}
+              aria-label="Message KINO"
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing && event.keyCode !== 229) {
+                  event.preventDefault();
+                  void sendMessage();
+                }
+              }}
               ref={inputRef}
               value={input}
               onChange={(event) =>
@@ -1084,24 +1021,13 @@ export default function Home() {
               autoComplete="off"
             />
 
-            <button
-              type="submit"
-              disabled={
-                isBusy || !input.trim()
-              }
-            >
-              {isBusy ? (
-                <span className="send-loader" />
-              ) : (
-                <>
-                  SEND
-
-                  <span className="send-arrow">
-                    ↑
-                  </span>
-                </>
-              )}
-            </button>
+            {isBusy ? (
+              <button type="button" aria-label="Stop response" onClick={() => activeRequestRef.current?.abort()}>Stop</button>
+            ) : (
+              <button type="submit" aria-label="Send message" disabled={!input.trim()}>
+                Send <span className="send-arrow" aria-hidden="true">{ "\u2191" }</span>
+              </button>
+            )}
           </div>
 
           <p className="command-hint">

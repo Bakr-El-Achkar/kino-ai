@@ -1,4 +1,6 @@
 import { InferenceConfigurationError, parseReasoningMode, resolveInference } from "@/lib/kino/ollama/inference";
+import { CHAT_STREAM_HEADERS, encodeChatEvent, type ChatStreamEvent } from "@/lib/kino/chat-stream";
+import { readOllamaRound, streamChatResponse } from "@/lib/kino/ollama/final-stream";
 import { observeBrowser, openBrowserUrl } from "@/lib/kino/browser-worker/client";
 import { formatBrowserToolResponse, unwrapToolResult } from "@/lib/kino/browser-worker/response";
 import { browserRuntimeStateMessage, requestedBrowserUrl } from "@/lib/kino/browser-worker/routing";
@@ -8,7 +10,6 @@ import { ollamaHttpErrorDiagnostics } from "@/lib/kino/ollama/http-error-diagnos
 import {
   buildQwenAgentTranscript,
   type ContinuationReason,
-  type OllamaToolCall,
   type OllamaTranscriptMessage,
   type VisibleConversationMessage,
 } from "@/lib/kino/ollama/transcript";
@@ -27,10 +28,6 @@ const MAX_BROWSER_STEPS = Math.min(25, Math.max(5, Number.parseInt(process.env.K
 const MAX_RUNTIME_MS = Math.max(30_000, Number.parseInt(process.env.KINO_BROWSER_MAX_RUNTIME_MS ?? "180000", 10) || 180_000);
 
 type UserChatMessage = VisibleConversationMessage;
-type OllamaResponse = {
-  message?: { content?: string; thinking?: string; tool_calls?: OllamaToolCall[] };
-  error?: string;
-};
 type AiTransportStage = "NOT_STARTED" | "FETCHING_HEADERS" | "READING_ERROR_BODY" | "READING_BODY" | "VALIDATING_RESPONSE";
 
 const KINO_SYSTEM_PROMPT = `
@@ -48,17 +45,22 @@ Ordinary non-secret fields may be filled using semantic IDs. A state-changing wr
 
 Normal HTTP(S) page links are READ_NAVIGATION and should be followed without asking for write confirmation. Downloads are different: do not claim or attempt download handling when the worker reports DOWNLOAD_REQUIRES_HANDLING. If an element is stale or navigation is unverified, observe again and continue only from fresh semantic IDs. A user's “don't ask me” or similar wording never pre-authorizes current or future write actions.
 
+When a tool is needed, emit structured tool calls before any user-facing content. Otherwise answer directly.
+
 Keep responses concise and answer in the user's language. Never expose private reasoning or internal implementation details.
 `.trim();
 
 function plain(content: string, status = 200) {
-  return new Response(content, {
-    status,
-    headers: {
-      "Content-Type": "text/plain; charset=utf-8",
-      "Cache-Control": "no-cache, no-transform",
-      "X-Accel-Buffering": "no",
+  return new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(encodeChatEvent({ type: "start" }));
+      controller.enqueue(encodeChatEvent({ type: "delta", content }));
+      controller.enqueue(encodeChatEvent({ type: "done" }));
+      controller.close();
     },
+  }), {
+    status,
+    headers: CHAT_STREAM_HEADERS,
   });
 }
 
@@ -90,6 +92,7 @@ async function callOllama(
   tools: ReturnType<typeof getOllamaTools>,
   inference: ReturnType<typeof resolveInference>,
   signal: AbortSignal,
+  publish: (event: ChatStreamEvent) => void,
   onStage: (stage: AiTransportStage) => void,
   onHttpError: (diagnostics: Awaited<ReturnType<typeof ollamaHttpErrorDiagnostics>>) => void,
 ) {
@@ -98,7 +101,7 @@ async function callOllama(
     model: inference.model,
     messages,
     tools,
-    stream: false,
+    stream: true,
     think: inference.think,
     keep_alive: -1,
     options: requestOptions,
@@ -130,23 +133,10 @@ async function callOllama(
     throw httpError;
   }
   onStage("READING_BODY");
-  const result = (await response.json().catch((error: unknown) => {
-    // JSON parser errors may contain upstream text. Preserve only the transient EOF category.
-    if (error instanceof SyntaxError) {
-      throw new SyntaxError(/unexpected end of json input/i.test(error.message)
-        ? "Unexpected end of JSON input" : "Invalid model response JSON.");
-    }
-    throw error;
-  })) as OllamaResponse;
+  if (!response.body) throw new Error("Ollama returned no response stream.");
+  const result = await readOllamaRound(response.body, signal, new Set(tools.map(tool => tool.function.name)), publish);
   onStage("VALIDATING_RESPONSE");
-  if (result.error) {
-    const applicationError = new Error("The model returned an application error.");
-    applicationError.name = "OllamaApplicationError";
-    throw applicationError;
-  }
-  if (!result.message) throw new Error("Ollama returned no assistant message.");
-  // Deliberately discard message.thinking before any transcript, tool, or UI handling.
-  return { content: result.message.content, tool_calls: result.message.tool_calls };
+  return result;
 }
 
 export async function POST(request: Request) {
@@ -194,114 +184,130 @@ export async function POST(request: Request) {
     let narrationContinuations = 0;
     let continuationReason: ContinuationReason = "TOOL_RESULT";
 
-    for (let round = 1; round <= MAX_BROWSER_STEPS; round += 1) {
-      agentStep = round;
-      agentPhase = round === 1 ? "INITIAL_REASONING" : "CONTINUATION";
-      if (Date.now() - startedAt > MAX_RUNTIME_MS) return plain("KINO stopped because the browser-operation runtime limit was reached.");
-      const requestMessages = buildQwenAgentTranscript({
-        systemMessage,
-        visibleConversation,
-        toolTranscript,
-        activeUserGoal: latestMessage,
-        continuationReason: round === 1 ? undefined : continuationReason,
-      });
-      let aiRequestAttempt = 0;
-      const assistant = await withTransientAiTransportRetry(
-        () => {
-          const retryAttempt = aiRequestAttempt;
-          aiRequestAttempt += 1;
-          return callOllama(
-            requestMessages,
-            tools,
-            inference,
-            request.signal,
-            (stage) => { aiTransportStage = stage; },
-            (diagnostics) => console.error("KINO_OLLAMA_HTTP_ERROR", {
-              // Never log free-form upstream error text or headers.
-              upstreamStatus: diagnostics.upstreamStatus,
-              modelErrorClassification: diagnostics.modelErrorClassification,
-              requestBytes: diagnostics.requestBytes,
-              messageCount: diagnostics.messageCount,
-              toolDefinitionCount: diagnostics.toolDefinitionCount,
-              configuredNumCtx: diagnostics.configuredNumCtx,
-              configuredNumPredict: diagnostics.configuredNumPredict,
-              reasoningMode,
+    return streamChatResponse(request.signal, MAX_RUNTIME_MS - (Date.now() - startedAt), async (send, signal) => {
+      let visiblePublished = false;
+      const publish = (event: ChatStreamEvent) => {
+        if (event.type === "delta" && event.content) visiblePublished = true;
+        send(event);
+      };
+      const finish = (content: string) => { publish({ type: "delta", content }); };
+      for (let round = 1; round <= MAX_BROWSER_STEPS; round += 1) {
+        agentStep = round;
+        agentPhase = round === 1 ? "INITIAL_REASONING" : "CONTINUATION";
+        if (Date.now() - startedAt > MAX_RUNTIME_MS) return finish("KINO stopped because the browser-operation runtime limit was reached.");
+        const requestMessages = buildQwenAgentTranscript({
+          systemMessage,
+          visibleConversation,
+          toolTranscript,
+          activeUserGoal: latestMessage,
+          continuationReason: round === 1 ? undefined : continuationReason,
+        });
+        let aiRequestAttempt = 0;
+        const assistant = await withTransientAiTransportRetry(
+          () => {
+            const retryAttempt = aiRequestAttempt;
+            aiRequestAttempt += 1;
+            return callOllama(
+              requestMessages,
+              tools,
+              inference,
+              signal,
+              publish,
+              (stage) => { aiTransportStage = stage; },
+              (diagnostics) => console.error("KINO_OLLAMA_HTTP_ERROR", {
+                // Never log free-form upstream error text or headers.
+                upstreamStatus: diagnostics.upstreamStatus,
+                modelErrorClassification: diagnostics.modelErrorClassification,
+                requestBytes: diagnostics.requestBytes,
+                messageCount: diagnostics.messageCount,
+                toolDefinitionCount: diagnostics.toolDefinitionCount,
+                configuredNumCtx: diagnostics.configuredNumCtx,
+                configuredNumPredict: diagnostics.configuredNumPredict,
+                reasoningMode,
+                agentPhase,
+                agentStep,
+                browserActionCompleted,
+                elapsedMs: Date.now() - startedAt,
+                retryAttempt,
+              }),
+            ).catch(error => {
+              // Retry only an unpublished inference round, never the surrounding tool loop.
+              if (visiblePublished) throw new Error("Published model stream interrupted.");
+              throw error;
+            });
+          },
+          {
+            signal,
+            startedAt,
+            maxRuntimeMs: MAX_RUNTIME_MS,
+            onRetry: (error, retryAttempt) => console.warn("KINO_AI_TRANSPORT_RETRY", {
+              ...safeErrorDiagnostics(error),
               agentPhase,
               agentStep,
               browserActionCompleted,
+              aiTransportStage,
               elapsedMs: Date.now() - startedAt,
               retryAttempt,
             }),
-          );
-        },
-        {
-          signal: request.signal,
-          startedAt,
-          maxRuntimeMs: MAX_RUNTIME_MS,
-          onRetry: (error, retryAttempt) => console.warn("KINO_AI_TRANSPORT_RETRY", {
-            ...safeErrorDiagnostics(error),
-            agentPhase,
-            agentStep,
-            browserActionCompleted,
-            aiTransportStage,
-            elapsedMs: Date.now() - startedAt,
-            retryAttempt,
-          }),
-        },
-      );
-      const toolCalls = assistant.tool_calls ?? [];
-      toolTranscript.push({ role: "assistant", content: assistant.content ?? "", tool_calls: toolCalls.length ? toolCalls : undefined });
-      if (!toolCalls.length) {
-        agentPhase = "FINAL_SYNTHESIS";
-        const content = assistant.content?.trim() ?? "";
-        if (shouldContinueSafeBrowserNarration(latestMessage, content, narrationContinuations)) {
-          narrationContinuations += 1;
-          continuationReason = "NARRATED_SAFE_STEP";
-          continue;
+          },
+        );
+        const toolCalls = assistant.tool_calls ?? [];
+        toolTranscript.push({ role: "assistant", content: assistant.content ?? "", tool_calls: toolCalls.length ? toolCalls : undefined });
+        if (!toolCalls.length) {
+          agentPhase = "FINAL_SYNTHESIS";
+          const content = assistant.content?.trim() ?? "";
+          if (shouldContinueSafeBrowserNarration(latestMessage, content, narrationContinuations)) {
+            publish({ type: "reset" });
+            narrationContinuations += 1;
+            continuationReason = "NARRATED_SAFE_STEP";
+            continue;
+          }
+          if (!content) finish("KINO completed without a final response.");
+          return;
         }
-        return plain(content || "KINO completed without a final response.");
-      }
 
-      // One tool step per round preserves observe → reason → act ordering.
-      for (const call of toolCalls.slice(0, 1)) {
-        agentPhase = "TOOL_EXECUTION";
-        const toolName = call.function.name;
-        const args = call.function.arguments ?? {};
-        if (toolName.startsWith("web_")) {
-          const duplicateKey = `${toolName}:${JSON.stringify(args)}`;
-          const duplicateCount = (duplicateActions.get(duplicateKey) ?? 0) + 1;
-          duplicateActions.set(duplicateKey, duplicateCount);
-          if (duplicateCount >= 3) return plain("KINO stopped because the same browser action repeated without progress.");
-          actionHistory.push(duplicateKey);
-          if (actionHistory.length >= 6) {
-            const recent = actionHistory.slice(-6);
-            if (recent[0] === recent[2] && recent[2] === recent[4] && recent[1] === recent[3] && recent[3] === recent[5]) {
-              return plain("KINO stopped because browser navigation was cycling without progress.");
+        // One tool step per round preserves observe → reason → act ordering.
+        for (const call of toolCalls.slice(0, 1)) {
+          signal.throwIfAborted();
+          agentPhase = "TOOL_EXECUTION";
+          const toolName = call.function.name;
+          const args = call.function.arguments ?? {};
+          if (toolName.startsWith("web_")) {
+            const duplicateKey = `${toolName}:${JSON.stringify(args)}`;
+            const duplicateCount = (duplicateActions.get(duplicateKey) ?? 0) + 1;
+            duplicateActions.set(duplicateKey, duplicateCount);
+            if (duplicateCount >= 3) return finish("KINO stopped because the same browser action repeated without progress.");
+            actionHistory.push(duplicateKey);
+            if (actionHistory.length >= 6) {
+              const recent = actionHistory.slice(-6);
+              if (recent[0] === recent[2] && recent[2] === recent[4] && recent[1] === recent[3] && recent[3] === recent[5]) {
+                return finish("KINO stopped because browser navigation was cycling without progress.");
+              }
             }
           }
+          let result: unknown;
+          try {
+            result = await executeKinoTool(toolName, args, context);
+          } catch (error) {
+            result = { success: false, status: "ACTION_FAILED", message: error instanceof Error ? error.message : "The tool failed." };
+          }
+          toolTranscript.push({ role: "tool", tool_name: toolName, content: JSON.stringify(result) });
+          continuationReason = "TOOL_RESULT";
+          const unwrapped = unwrapToolResult(result);
+          if (toolName.startsWith("web_") && ["OPENED", "ACTION_COMPLETED", "AUTH_SUCCESS"].includes(String(unwrapped?.status ?? ""))) {
+            browserActionCompleted = true;
+          }
+          const recoveryStatus = typeof unwrapped?.status === "string" ? unwrapped.status : "";
+          if (toolName === "web_action" && ["STALE_ELEMENT", "NAVIGATION_UNVERIFIED"].includes(recoveryStatus)) {
+            const refreshed = await executeKinoTool("web_observe", {}, context).catch(() => null);
+            if (refreshed) toolTranscript.push({ role: "tool", tool_name: "web_observe", content: JSON.stringify(refreshed) });
+          }
+          const stop = toolName.startsWith("web_") ? browserStopResponse(result) : null;
+          if (stop) return finish(stop);
         }
-        let result: unknown;
-        try {
-          result = await executeKinoTool(toolName, args, context);
-        } catch (error) {
-          result = { success: false, status: "ACTION_FAILED", message: error instanceof Error ? error.message : "The tool failed." };
-        }
-        toolTranscript.push({ role: "tool", tool_name: toolName, content: JSON.stringify(result) });
-        continuationReason = "TOOL_RESULT";
-        const unwrapped = unwrapToolResult(result);
-        if (toolName.startsWith("web_") && ["OPENED", "ACTION_COMPLETED", "AUTH_SUCCESS"].includes(String(unwrapped?.status ?? ""))) {
-          browserActionCompleted = true;
-        }
-        const recoveryStatus = typeof unwrapped?.status === "string" ? unwrapped.status : "";
-        if (toolName === "web_action" && ["STALE_ELEMENT", "NAVIGATION_UNVERIFIED"].includes(recoveryStatus)) {
-          const refreshed = await executeKinoTool("web_observe", {}, context).catch(() => null);
-          if (refreshed) toolTranscript.push({ role: "tool", tool_name: "web_observe", content: JSON.stringify(refreshed) });
-        }
-        const stop = toolName.startsWith("web_") ? browserStopResponse(result) : null;
-        if (stop) return plain(stop);
       }
-    }
-    return plain(`KINO reached the configured maximum of ${MAX_BROWSER_STEPS} browser steps without completing the goal.`);
+      return finish(`KINO reached the configured maximum of ${MAX_BROWSER_STEPS} browser steps without completing the goal.`);
+    });
   } catch (error) {
     if (error instanceof InferenceConfigurationError) {
       return Response.json({ error: error.message, code: error.code }, {

@@ -1,6 +1,8 @@
 ﻿import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import ts from 'typescript';
+import * as chatStream from '../lib/kino/chat-stream.ts';
+import * as finalStream from '../lib/kino/ollama/final-stream.ts';
 import * as inference from '../lib/kino/ollama/inference.ts';
 import * as transcript from '../lib/kino/ollama/transcript.ts';
 import * as retry from '../lib/kino/ollama/transport-retry.ts';
@@ -31,6 +33,8 @@ assert.throws(() => inference.resolveInference('thinking', {}), { code: 'THINKIN
 // transcript, transport retry, response formatting, and continuation implementations.
 let actions = [], requests = [], queue = [], logs = [];
 const modules = {
+  '@/lib/kino/chat-stream': chatStream,
+  '@/lib/kino/ollama/final-stream': finalStream,
   '@/lib/kino/ollama/inference': inference,
   '@/lib/kino/ollama/transcript': transcript,
   '@/lib/kino/ollama/transport-retry': retry,
@@ -65,7 +69,15 @@ const tool = (step, extra = {}) => ({ message: { content: '', thinking: secret, 
 async function run(body, replies) {
   actions = []; requests = []; logs = []; queue = [...replies];
   const result = await exports.POST(new Request('http://localhost/api/kino', { method: 'POST', body: JSON.stringify({ messages: [{ role: 'user', content: 'Complete the browser goal' }], ...body }) }));
-  const text = await result.text();
+  const wire = await result.text();
+  const events = result.headers.get('content-type')?.includes('ndjson')
+    ? wire.trim().split('\n').map(line => JSON.parse(line)) : [];
+  let text = events.length ? '' : wire;
+  for (const event of events) {
+    if (event.type === 'reset') text = '';
+    if (event.type === 'delta') text += event.content;
+  }
+  assert.ok(!wire.includes(secret), 'Raw thinking reached the client wire');
   assert.ok(!JSON.stringify({ text, requests, actions, logs }).includes(secret), 'Raw thinking escaped response boundary');
   return { status: result.status, text };
 }
@@ -75,16 +87,45 @@ try {
   delete process.env.KINO_THINK_NUM_CTX; delete process.env.KINO_THINK_NUM_PREDICT;
   console.error = (...args) => logs.push(args); console.warn = (...args) => logs.push(args);
   globalThis.fetch = async (_url, init) => {
-    requests.push(JSON.parse(init.body));
+    const modelRequest = JSON.parse(init.body);
+    requests.push(modelRequest);
+    assert.equal(modelRequest.stream, true, 'Every model round must stream');
     assert.ok(queue.length, 'Unexpected model call/retry');
     const next = queue.shift();
     if (next instanceof Error) throw next;
-    return next instanceof Response ? next : Response.json(next);
+    if (next instanceof Response) return next;
+    const records = Array.isArray(next) ? next : [
+      { message: { thinking: secret }, done: false },
+      { ...next, done: false }, { done: true },
+    ];
+    return new Response(records.map(record => JSON.stringify(record)).join('\n'), { headers: { 'Content-Type': 'application/x-ndjson' } });
   };
   assert.deepEqual(await run({ model: 'client-override', think: true }, [{ message: { content: 'Normal answer', thinking: secret } }]), { status: 200, text: 'Normal answer' });
+  assert.equal(requests.length, 1, 'Simple chat must use exactly one generation');
   assert.equal(requests[0].model, env.OLLAMA_MODEL);
   assert.equal(requests[0].think, false);
   assert.deepEqual(requests[0].options, { num_ctx: 8192, num_predict: 1024 });
+  for (const reasoningMode of ['normal', 'thinking']) {
+    let upstream;
+    actions = []; requests = []; logs = [];
+    queue = [new Response(new ReadableStream({ start(controller) { upstream = controller; } }))];
+    const response = await exports.POST(new Request('http://localhost/api/kino', {
+      method: 'POST', body: JSON.stringify({ reasoningMode, messages: [{ role: 'user', content: 'Say hello' }] }),
+    }));
+    const reader = chatStream.readNdjson(response.body)[Symbol.asyncIterator]();
+    assert.deepEqual((await reader.next()).value, { type: 'start' });
+    upstream.enqueue(new TextEncoder().encode(JSON.stringify({ message: { thinking: secret } }) + '\n'));
+    upstream.enqueue(new TextEncoder().encode(JSON.stringify({ message: { content: 'Hello ' } }) + '\n'));
+    assert.deepEqual((await reader.next()).value, { type: 'delta', content: 'Hello ' });
+    assert.equal(requests.length, 1, 'First visible text required an extra generation');
+    assert.equal(requests[0].model, reasoningMode === 'normal' ? env.OLLAMA_MODEL : env.OLLAMA_THINKING_MODEL);
+    upstream.enqueue(new TextEncoder().encode(JSON.stringify({ message: { content: 'KINO' }, done: true }) + '\n'));
+    assert.deepEqual((await reader.next()).value, { type: 'delta', content: 'KINO' });
+    assert.deepEqual((await reader.next()).value, { type: 'done' });
+    assert.equal((await reader.next()).done, true);
+    assert.equal(requests.length, 1, 'Tool-free answer was generated twice');
+    assert.equal(actions.length, 0);
+  }
   for (const steps of [0, 1, 2, 3]) {
     const body = { reasoningMode: 'thinking', model: 'untrusted', messages: [{ role: 'user', content: 'Complete the browser goal', thinking: secret }] };
     const before = JSON.stringify(body);
@@ -92,6 +133,7 @@ try {
     assert.equal(result.text, 'Verified final answer');
     assert.equal(JSON.stringify(body), before, 'Visible history mutated');
     assert.equal(actions.length, steps, 'Completed actions replayed');
+    assert.equal(requests.length, steps + 1, 'Final answer was generated twice');
     for (const [index, request] of requests.entries()) {
       assert.equal(request.model, env.OLLAMA_THINKING_MODEL);
       assert.equal(request.think, true);
@@ -106,6 +148,57 @@ try {
   }
   await run({ reasoningMode: 'thinking' }, [tool(0), new TypeError('terminated'), { message: { content: 'Done', thinking: secret } }]);
   assert.equal(actions.length, 1); assert.equal(requests.length, 3);
+  const interrupted = await run({ reasoningMode: 'thinking' }, [tool(0), [
+    { message: { thinking: secret, content: 'Visible prefix' }, done: false },
+    { error: secret },
+  ]]);
+  assert.equal(interrupted.text, 'Visible prefix');
+  assert.equal(actions.length, 1, 'Streaming failure replayed a completed action');
+  assert.equal(requests.length, 2, 'Visible generation must not retry');
+  const unexpectedTool = await run({}, [tool(0), [
+    { message: { tool_calls: [{ function: { name: 'web_action', arguments: '{partial' } }], content: secret }, done: false },
+    { done: true },
+  ]]);
+  assert.equal(unexpectedTool.text, '');
+  assert.equal(actions.length, 1, 'Partial streaming tool call executed');
+  assert.equal(requests.length, 2);
+  const mixed = await run({}, [[
+    { message: { content: 'Let me check.' }, done: false },
+    tool(0), { done: true },
+  ], { message: { content: 'Verified answer' } }]);
+  assert.equal(mixed.text, 'Verified answer', 'Tool preamble was not cleared');
+  assert.equal(actions.length, 1);
+  assert.equal(requests.length, 2, 'Mixed round regenerated its final answer');
+  let toolChunkSent = false;
+  const brokenToolStream = new Response(new ReadableStream({
+    pull(controller) {
+      if (!toolChunkSent) {
+        toolChunkSent = true;
+        controller.enqueue(new TextEncoder().encode(JSON.stringify(tool(0)) + '\n'));
+      } else controller.error(new TypeError('terminated'));
+    },
+  }));
+  await run({}, [brokenToolStream, tool(0), { message: { content: 'Done once' } }]);
+  assert.equal(actions.length, 1, 'Retry executed an incomplete tool or replayed it');
+  assert.equal(requests.length, 3);
+  let textChunkSent = false;
+  const brokenTextStream = new Response(new ReadableStream({
+    pull(controller) {
+      if (!textChunkSent) {
+        textChunkSent = true;
+        controller.enqueue(new TextEncoder().encode(JSON.stringify({ message: { content: 'Kept once' } }) + '\n'));
+      } else controller.error(new TypeError('terminated'));
+    },
+  }));
+  assert.equal((await run({}, [brokenTextStream])).text, 'Kept once');
+  assert.equal(requests.length, 1, 'Published stream was retried');
+  // The existing narration continuation still executes the needed tool before synthesis.
+  const continued = await run({ messages: [{ role: 'user', content: 'Open the website and find details' }] }, [
+    { message: { content: 'Let me open the website.' } }, tool(1), { message: { content: 'Done' } },
+  ]);
+  assert.equal(continued.text, 'Done');
+  assert.equal(actions.length, 1);
+  assert.equal(requests.length, 3);
   for (const user of ["don't ask me", 'Complete the browser goal']) {
     const result = await run({ reasoningMode: 'thinking', messages: [{ role: 'user', content: user }] }, [tool(0, { action: 'confirm_pending', confirmation: 'yes' })]);
     assert.equal(actions[0].context.latestUserMessage, user);
