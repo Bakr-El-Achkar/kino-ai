@@ -2108,192 +2108,48 @@ footer span:last-child {
   to { left: 100%; }
 }
 
+/* Compact KINO composer */
 .command-section {
   position: relative;
   z-index: 15;
-
   width: 100%;
-
-  padding:
-    12px
-    20px
-    15px;
-
-  border-top:
-    1px solid rgba(85, 201, 239, 0.07);
-
-  background:
-    linear-gradient(
-      180deg,
-      rgba(2, 8, 12, 0.88),
-      rgba(2, 7, 10, 0.98)
-    );
-
+  padding: 12px 20px max(12px, env(safe-area-inset-bottom));
+  background: linear-gradient(180deg, rgba(2, 8, 12, .88), #02070a);
   backdrop-filter: blur(22px);
 }
-
-.command-container {
-  width: min(940px, 94vw);
-
-  margin: 0 auto;
-}
-
-.command-top {
-  margin-bottom: 8px;
-
-  padding: 0 3px;
-
-  display: flex;
-  justify-content: space-between;
-
-  gap: 15px;
-}
-
-.command-mode,
-.command-status {
-  color:
-    rgba(111, 199, 226, 0.35);
-
-  font-size: 6px;
-
-  letter-spacing: 1.5px;
-}
-
-.deep-mode-active .command-mode {
-  color:
-    rgba(194, 156, 255, 0.62);
-}
-
-.command-input-row {
-  display: grid;
-
-  grid-template-columns:
-    minmax(0, 1fr)
-    auto;
-
-  gap: 8px;
-
-  padding: 7px;
-
-  border:
-    1px solid rgba(92, 211, 247, 0.16);
-
-  background:
-    rgba(3, 18, 25, 0.72);
-
-  box-shadow:
-    0 10px 40px rgba(0, 0, 0, 0.17);
-}
-
-.command-input-row:focus-within {
-  border-color:
-    rgba(89, 220, 255, 0.38);
-
-  box-shadow:
-    0 0 25px rgba(0, 194, 255, 0.045);
-}
-
-.command-input-row input {
-  width: 100%;
-
-  padding: 12px 13px;
-
-  border: none;
-  outline: none;
-
-  background: transparent;
-
-  color:
-    rgba(224, 246, 252, 0.88);
-
-  font-size: 12px;
-}
-
-.command-input-row input::placeholder {
-  color:
-    rgba(125, 177, 194, 0.27);
-}
-
-.command-input-row button {
-  min-width: 92px;
-
-  padding: 0 18px;
-
-  display: flex;
-  align-items: center;
-  justify-content: center;
-
-  gap: 8px;
-
-  border:
-    1px solid rgba(87, 216, 252, 0.22);
-
-  background:
-    linear-gradient(
-      135deg,
-      rgba(0, 152, 203, 0.13),
-      rgba(0, 91, 124, 0.08)
-    );
-
-  color: #7ae6ff;
-
-  font-size: 7px;
-  letter-spacing: 1.5px;
-
-  cursor: pointer;
-
-  transition: 0.25s ease;
-}
-
-.command-input-row button:hover:not(:disabled) {
-  border-color:
-    rgba(101, 229, 255, 0.6);
-
-  background:
-    rgba(0, 164, 217, 0.18);
-
-  box-shadow:
-    0 0 20px rgba(0, 195, 255, 0.08);
-}
-
-.command-input-row button:disabled {
-  opacity: 0.32;
-  cursor: not-allowed;
-}
-
-.send-arrow {
-  font-size: 11px;
-}
-
-.send-loader {
-  width: 12px;
-  height: 12px;
-
-  border-radius: 50%;
-
-  border:
-    1px solid rgba(116, 230, 255, 0.2);
-
-  border-top-color: #72e5ff;
-
-  animation:
-    spin
-    0.7s
-    linear
-    infinite;
-}
-
-.command-hint {
-  margin-top: 7px;
-
-  text-align: center;
-
-  color:
-    rgba(121, 168, 184, 0.22);
-
-  font-size: 6px;
-
-  letter-spacing: 0.8px;
+.command-container { width: min(100%, 812px); margin: 0 auto; }
+.command-top { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 10px; padding: 0 4px; }
+.command-status { color: #86a6af; font-size: 8px; letter-spacing: 1.2px; }
+.composer-modes { display: flex; gap: 3px; padding: 3px; border: 1px solid #20383e; border-radius: 12px; background: #071014; }
+.composer-modes button { border: 1px solid transparent; border-radius: 9px; background: transparent; color: #94afb8; padding: 7px 15px; font-size: 11px; font-weight: 600; letter-spacing: .8px; cursor: pointer; transition: background 180ms, color 180ms, border-color 180ms; }
+.composer-modes button:hover:not(:disabled) { color: #e4faf9; background: #12252b; }
+.composer-modes button[aria-pressed="true"] { border-color: #315b62; background: #142c32; color: #b1f1ed; }
+.composer-modes button:disabled { opacity: .5; cursor: wait; }
+.composer-surface { padding: 8px; border: 1px solid #29464c; border-radius: 20px; background: linear-gradient(135deg, #0c191f, #080f14); box-shadow: 0 12px 32px #00000030; transition: border-color 180ms, box-shadow 180ms; }
+.composer-surface:focus-within { border-color: #548f94; box-shadow: 0 0 22px #45c9c00b; }
+.command-input-row { display: grid; grid-template-columns: 44px minmax(0, 1fr) 44px; align-items: end; gap: 8px; }
+.command-input-row textarea { display: block; width: 100%; min-width: 0; min-height: 44px; max-height: 180px; padding: 10px 4px; resize: none; border: 0; outline: none; background: transparent; color: #e0f0f7; font: inherit; font-size: 16px; line-height: 24px; }
+.command-input-row textarea::placeholder { color: #91a9b2; }
+.command-input-row button { display: flex; align-items: center; justify-content: center; width: 44px; height: 44px; padding: 0; border: 1px solid #345c63; border-radius: 13px; background: #183b40; color: #c0f5ef; font-size: 11px; cursor: pointer; transition: background 180ms, border-color 180ms, color 180ms; }
+.command-input-row .image-upload-attach { border-color: transparent; background: transparent; color: #a3c6ce; font-size: 26px; }
+.command-input-row button:hover:not(:disabled) { background: #21484e; border-color: #619b9f; color: #edfffc; }
+.command-input-row button:disabled { opacity: .4; cursor: not-allowed; }
+.command-section button:focus-visible { outline: 2px solid #a0eee5; outline-offset: 3px; }
+.send-arrow { font-size: 24px; line-height: 1; }
+.image-upload-preview, .image-upload-error { display: flex; align-items: center; gap: 12px; margin: 0 0 8px; padding: 10px; border: 1px solid #29404b; border-radius: 12px; color: #c6dbe2; font-size: 13px; }
+.image-upload-preview img { width: 48px; height: 48px; object-fit: contain; border-radius: 8px; background: #050c10; }
+.image-upload-details { display: grid; gap: 4px; flex: 1; min-width: 0; }
+.image-upload-details span { overflow-wrap: anywhere; }
+.image-upload-details small { color: #97b0ba; font-size: 12px; }
+.image-upload-error span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.image-upload-preview button, .image-upload-error button { min-width: 44px; min-height: 44px; padding: 6px; border: 1px solid transparent; border-radius: 9px; background: transparent; color: inherit; cursor: pointer; flex-shrink: 0; transition: background 180ms; }
+.image-upload-preview button { font-size: 23px; }
+.image-upload-preview button:hover:not(:disabled), .image-upload-error button:hover { background: #22363e; }
+.image-upload-preview button:disabled { opacity: .4; cursor: not-allowed; }
+.image-upload-error { color: #f4b7b7; }
+.command-hint { margin: 8px 4px 0; font-size: 11px; line-height: 1.5; letter-spacing: 0; color: #92abb4; }
+@media (prefers-reduced-motion: reduce) {
+  .command-section *, .composer-surface { transition: none; }
 }
 
 /* =========================================================
@@ -2460,9 +2316,6 @@ footer span:last-child {
     height: 27px;
   }
 
-  .command-container {
-    width: 97vw;
-  }
 
   .chat-footer {
     grid-template-columns:
@@ -2724,26 +2577,6 @@ footer span:last-child {
 .chat-empty .message-avatar { margin: 0 auto 20px; width: 44px; height: 44px; font-size: 16px; }
 .chat-empty h1 { font-size: 28px; font-weight: 500; margin-bottom: 12px; }
 .chat-empty p { color: #91aab6; font-size: 14px; line-height: 1.7; }
-.command-section { padding: 12px 20px max(12px, env(safe-area-inset-bottom)); border-top: 0; }
-.command-container { width: min(100%, 812px); }
-.command-top { align-items: center; }
-.command-status { font-size: 8px; }
-.composer-modes { display: flex; gap: 4px; }
-.composer-modes button { border: 1px solid transparent; border-radius: 8px; background: transparent; color: #8aa6b2; padding: 8px 12px; font-size: 11px; cursor: pointer; }
-.composer-modes button[aria-pressed="true"] { border-color: #284f60; background: #112731; color: #91eaff; }
-.deep-mode-active .composer-modes button[aria-pressed="true"] { border-color: #5b447b; color: #d0b4ff; }
-.composer-modes button:disabled { opacity: .5; cursor: wait; }
-.command-input-row { border-radius: 20px; align-items: end; padding: 8px; }
-.command-input-row textarea { display: block; width: 100%; min-height: 46px; max-height: 180px; padding: 10px 12px; resize: none; border: 0; outline: none; background: transparent; color: #e0f0f7; font: inherit; font-size: 16px; line-height: 1.6; }
-.command-input-row textarea::placeholder { color: #78929d; }
-.command-input-row button { min-width: 64px; height: 44px; padding: 0 12px; border-radius: 13px; font-size: 10px; }
-.command-input-row .image-upload-attach { min-width: 40px; width: 40px; flex-shrink: 0; font-size: 24px; }
-.image-upload-preview, .image-upload-error { display: flex; align-items: center; gap: 12px; margin: 8px 0; padding: 10px; border: 1px solid #29404b; border-radius: 12px; color: #a5bcc6; font-size: 13px; }
-.image-upload-preview img { width: 72px; height: 72px; object-fit: contain; border-radius: 8px; }
-.image-upload-preview span, .image-upload-error span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
-.image-upload-preview button, .image-upload-error button { padding: 6px; cursor: pointer; flex-shrink: 0; }
-.image-upload-error { color: #f4b7b7; }
-.command-hint { font-size: 10px; line-height: 1.5; letter-spacing: 0; color: #6c8996; }
 .secure-login-card { max-width: 100%; min-width: 0; }
 .chat-error { width: 100%; padding: 10px 0; border: 0; background: transparent; font-size: 13px; line-height: 1.6; }
 .chat-error span { display: block; margin-bottom: 3px; font-size: 12px; letter-spacing: 0; }

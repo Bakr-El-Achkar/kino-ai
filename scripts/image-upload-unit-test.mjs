@@ -187,6 +187,46 @@ test('upstream errors cannot expose uploaded base64 in client errors or logs', a
 
 // Same running-app convention as chat-stream-ui-test.mjs. API requests are
 // intercepted, so this never contacts Ollama or the browser worker through Next.
+for (const width of [1280, 390]) {
+  test(`composer picker and compact control layout at ${width}px`, { timeout: 60_000 }, async () => {
+    const page = await browser.newPage({ viewport: { width, height: 800 } });
+    try {
+      await page.goto(process.env.CHAT_TEST_URL || 'http://localhost:3100');
+      const text = page.getByRole('textbox', { name: 'Message KINO', exact: true });
+      await text.fill('');
+      const attach = page.getByRole('button', { name: 'Attach image', exact: true });
+      const chooserPromise = page.waitForEvent('filechooser', { timeout: 5000 });
+      await attach.click();
+      const chooser = await chooserPromise;
+      assert.equal(await chooser.element().getAttribute('type'), 'file');
+      assert.equal(await chooser.element().getAttribute('accept'), 'image/jpeg,image/png,image/webp');
+      assert.equal(chooser.isMultiple(), false);
+      const left = await attach.boundingBox();
+      const middle = await text.boundingBox();
+      const right = await page.getByRole('button', { name: 'Send message', exact: true }).boundingBox();
+      assert.ok(Math.abs(left.y - right.y) < 4, 'Attach and send must occupy the same compact row');
+      assert.ok(left.x + left.width <= middle.x && middle.x + middle.width <= right.x, 'Controls must not overlap');
+      assert.ok((await page.locator('.command-input-row').boundingBox()).height < 90, 'Empty composer is too tall');
+      await chooser.setFiles({ name: 'sample.png', mimeType: 'image/png', buffer: Buffer.from(fixtures['image/png'].base64, 'base64') });
+      await page.getByAltText('Selected image preview').waitFor();
+      assert.ok(await page.locator('.image-upload-preview').innerText().then(value => /sample\.png/.test(value) && /KiB|MiB|bytes/.test(value)), 'Preview must show filename and size');
+      const oldUrl = await page.getByAltText('Selected image preview').getAttribute('src');
+      await page.getByRole('button', { name: 'Remove image', exact: true }).click();
+      assert.equal(await page.locator('input[type="file"]').evaluate(element => element.files.length), 0);
+      assert.equal(await page.evaluate(async url => { try { await fetch(url); return false; } catch { return true; } }, oldUrl), true, 'Removed preview URL must be revoked');
+      for (const [mimeType, name] of [['image/png', 'sample.png'], ['image/jpeg', 'sample.jpg'], ['image/webp', 'sample.webp']]) {
+        const nextChooser = page.waitForEvent('filechooser', { timeout: 5000 });
+        await attach.focus();
+        await attach.press('Enter');
+        await (await nextChooser).setFiles({ name, mimeType, buffer: Buffer.from(fixtures[mimeType].base64, 'base64') });
+        await page.getByAltText('Selected image preview').waitFor();
+        assert.ok((await page.locator('.image-upload-preview').innerText()).includes(name));
+        await page.getByRole('button', { name: 'Remove image', exact: true }).click();
+      }
+    } finally { await page.close(); }
+  });
+}
+
 test('composer selects one image, replaces its preview, and removes it before sending', { timeout: 60_000 }, async () => {
   const page = await browser.newPage();
   const sent = [];
@@ -232,6 +272,22 @@ test('composer selects one image, replaces its preview, and removes it before se
     await page.getByRole('button', { name: 'Send message', exact: true }).click();
     await followup;
     assert.equal(JSON.stringify(sent[2]).includes(fixtures['image/png'].base64), false, 'Image bytes persisted into later chat history');
+    await input.setInputFiles(file('image/jpeg', 'image-only.jpg'));
+    await text.fill('');
+    const imageOnly = page.waitForResponse('**/api/kino');
+    await page.getByRole('button', { name: 'Send message', exact: true }).click();
+    await imageOnly;
+    assert.equal(sent[3].messages.at(-1).content, 'Analyze this image.');
+    assert.equal(sent[3].image.mimeType, 'image/jpeg');
+    for (const [label, mode] of [['THINK', 'thinking'], ['FAST', 'normal']]) {
+      await page.getByRole('group', { name: 'Response mode' }).getByRole('button', { name: label, exact: true }).click();
+      await text.fill('Hello.');
+      const response = page.waitForResponse('**/api/kino');
+      await page.getByRole('button', { name: 'Send message', exact: true }).click();
+      await response;
+      assert.equal(sent.at(-1).reasoningMode, mode);
+      assert.ok(!sent.at(-1).image);
+    }
   } finally {
     await page.close();
   }

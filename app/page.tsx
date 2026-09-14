@@ -1054,11 +1054,17 @@ export default function Home() {
               setSelectedImage({ file, url: URL.createObjectURL(file) });
             }}
           />
+          <div className="composer-surface">
           {selectedImage && (
             <div className="image-upload-preview">
               <Image src={selectedImage.url} alt="Selected image preview" width={72} height={72} unoptimized />
-              <span>{selectedImage.file.name}</span>
-              <button type="button" onClick={removeImage} disabled={isBusy} aria-label="Remove image">Remove image</button>
+              <div className="image-upload-details">
+                <span>{selectedImage.file.name}</span>
+                <small>{selectedImage.file.size < 1024 * 1024
+                  ? `${Math.max(0.1, selectedImage.file.size / 1024).toFixed(1)} KiB`
+                  : `${(selectedImage.file.size / (1024 * 1024)).toFixed(1)} MiB`}</small>
+              </div>
+              <button type="button" onClick={removeImage} disabled={isBusy} aria-label="Remove image"><span aria-hidden="true">×</span></button>
             </div>
           )}
           {imageError && (
@@ -1094,7 +1100,7 @@ export default function Home() {
                   : kinoState ===
                       "responding"
                     ? "KINO is responding..."
-                    : "Message KINO..."
+                    : selectedImage ? "Ask KINO about this image..." : "Message KINO..."
               }
               disabled={isBusy}
               autoComplete="off"
@@ -1104,15 +1110,14 @@ export default function Home() {
               <button type="button" aria-label="Stop response" onClick={() => activeRequestRef.current?.abort()}>Stop</button>
             ) : (
               <button type="submit" aria-label="Send message" disabled={Boolean(imageError) || (!input.trim() && !selectedImage)}>
-                Send <span className="send-arrow" aria-hidden="true">{ "\u2191" }</span>
+                <span className="send-arrow" aria-hidden="true">{ "\u2191" }</span>
               </button>
             )}
           </div>
+          </div>
 
           <p className="command-hint">
-            Give KINO any public website URL.
-            It observes visible controls and acts
-            through a private browser worker.
+            Add image · JPG/PNG/WebP · max 3 MiB
           </p>
         </form>
       </section>
