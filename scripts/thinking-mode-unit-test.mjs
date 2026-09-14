@@ -5,6 +5,7 @@ import * as activity from '../lib/kino/activity.ts';
 import * as chatStream from '../lib/kino/chat-stream.ts';
 import * as finalStream from '../lib/kino/ollama/final-stream.ts';
 import * as inference from '../lib/kino/ollama/inference.ts';
+import * as userImage from '../lib/kino/ollama/user-image.ts';
 import * as transcript from '../lib/kino/ollama/transcript.ts';
 import * as retry from '../lib/kino/ollama/transport-retry.ts';
 import * as diagnostics from '../lib/kino/ollama/http-error-diagnostics.ts';
@@ -40,6 +41,7 @@ const modules = {
   '@/lib/kino/chat-stream': chatStream,
   '@/lib/kino/ollama/final-stream': finalStream,
   '@/lib/kino/ollama/inference': inference,
+  '@/lib/kino/ollama/user-image': userImage,
   '@/lib/kino/ollama/transcript': transcript,
   '@/lib/kino/ollama/transport-retry': retry,
   '@/lib/kino/ollama/http-error-diagnostics': diagnostics,

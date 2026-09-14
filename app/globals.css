@@ -2737,6 +2737,12 @@ footer span:last-child {
 .command-input-row textarea { display: block; width: 100%; min-height: 46px; max-height: 180px; padding: 10px 12px; resize: none; border: 0; outline: none; background: transparent; color: #e0f0f7; font: inherit; font-size: 16px; line-height: 1.6; }
 .command-input-row textarea::placeholder { color: #78929d; }
 .command-input-row button { min-width: 64px; height: 44px; padding: 0 12px; border-radius: 13px; font-size: 10px; }
+.command-input-row .image-upload-attach { min-width: 40px; width: 40px; flex-shrink: 0; font-size: 24px; }
+.image-upload-preview, .image-upload-error { display: flex; align-items: center; gap: 12px; margin: 8px 0; padding: 10px; border: 1px solid #29404b; border-radius: 12px; color: #a5bcc6; font-size: 13px; }
+.image-upload-preview img { width: 72px; height: 72px; object-fit: contain; border-radius: 8px; }
+.image-upload-preview span, .image-upload-error span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.image-upload-preview button, .image-upload-error button { padding: 6px; cursor: pointer; flex-shrink: 0; }
+.image-upload-error { color: #f4b7b7; }
 .command-hint { font-size: 10px; line-height: 1.5; letter-spacing: 0; color: #6c8996; }
 .secure-login-card { max-width: 100%; min-width: 0; }
 .chat-error { width: 100%; padding: 10px 0; border: 0; background: transparent; font-size: 13px; line-height: 1.6; }

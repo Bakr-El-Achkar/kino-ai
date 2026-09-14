@@ -4,6 +4,7 @@ import Image from "next/image";
 import { reasoningActivity, type Activity } from "@/lib/kino/activity";
 import { ActivityIndicator } from "@/components/chat/ActivityIndicator";
 import { consumeChatStream } from "@/lib/kino/chat-stream";
+import { DEFAULT_IMAGE_PROMPT, IMAGE_MIME_TYPES, imageFileError } from "@/lib/kino/image-upload";
 import { MarkdownMessage, CopyButton } from "@/components/chat/MarkdownMessage";
 import type { ReasoningMode } from "@/lib/kino/ollama/inference";
 import {
@@ -57,9 +58,37 @@ function browserHostname(url?: string) {
   }
 }
 
+function readImageBase64(file: File, signal: AbortSignal): Promise<string> {
+  return new Promise((resolve, reject) => {
+    signal.throwIfAborted();
+    const reader = new FileReader();
+    const abort = () => reader.abort();
+    signal.addEventListener("abort", abort, { once: true });
+    reader.onloadend = () => {
+      signal.removeEventListener("abort", abort);
+      if (signal.aborted || reader.error || typeof reader.result !== "string") {
+        reject(new Error("Unable to read the selected image."));
+      } else resolve(reader.result.slice(reader.result.indexOf(",") + 1));
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
 export default function Home() {
   const [input, setInput] =
     useState("");
+  const [selectedImage, setSelectedImage] = useState<{ file: File; url: string } | null>(null);
+  const [imageError, setImageError] = useState<string | null>(null);
+  const imageInputRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    return () => { if (selectedImage) URL.revokeObjectURL(selectedImage.url); };
+  }, [selectedImage]);
+
+  function removeImage() {
+    setSelectedImage(null);
+    setImageError(null);
+    if (imageInputRef.current) imageInputRef.current.value = "";
+  }
 
   const [messages, setMessages] =
     useState<Message[]>([
@@ -307,9 +336,9 @@ export default function Home() {
     event?.preventDefault();
 
     const command =
-      input.trim();
+      input.trim() || (selectedImage ? DEFAULT_IMAGE_PROMPT : "");
 
-    if (!command || isBusy || activeRequestRef.current) {
+    if (!command || imageError || isBusy || activeRequestRef.current) {
       return;
     }
 
@@ -332,7 +361,7 @@ export default function Home() {
     followOutputRef.current = true;
     setInput("");
     setError("");
-    setActivity(reasoningActivity(isDeepMode));
+    setActivity(reasoningActivity(isDeepMode && !selectedImage));
     setKinoState("thinking");
 
     const userMessage: Message = {
@@ -360,7 +389,7 @@ export default function Home() {
       conversationIdRef.current ??=
         crypto.randomUUID();
 
-      if (/https?:\/\/|\b(?:open|visit|browse|navigate|go\s+to)\b/i.test(command)) {
+      if (!selectedImage && /https?:\/\/|\b(?:open|visit|browse|navigate|go\s+to)\b/i.test(command)) {
         browserIntentRef.current = true;
         setBrowserIntent(true);
         if (!browserActiveRef.current) setBrowserPreviewState("starting");
@@ -380,6 +409,11 @@ export default function Home() {
           })
         );
 
+      const image = selectedImage ? {
+        mimeType: selectedImage.file.type,
+        base64: await readImageBase64(selectedImage.file, requestController.signal),
+      } : undefined;
+      requestController.signal.throwIfAborted();
       const response =
         await fetch("/api/kino", {
           method: "POST",
@@ -397,6 +431,7 @@ export default function Home() {
               conversationIdRef.current,
 
             reasoningMode: mode,
+            ...(image ? { image } : {}),
           }),
         });
 
@@ -426,6 +461,7 @@ export default function Home() {
           "KINO returned no response stream."
         );
       }
+      if (selectedImage) removeImage();
 
       /*
         Create an EMPTY KINO message.
@@ -530,7 +566,7 @@ export default function Home() {
         setKinoState("ready");
         return;
       }
-      console.error(err);
+      if (!selectedImage) console.error(err);
 
       setStreamingMessageId(
         null
@@ -545,6 +581,7 @@ export default function Home() {
 
       setKinoState("error");
     } finally {
+      if (selectedImage) removeImage();
       setActivity(null);
       if (activeRequestRef.current === requestController) activeRequestRef.current = null;
       if (!requestController.signal.aborted) {
@@ -996,7 +1033,42 @@ export default function Home() {
             </span>
           </div>
 
+          <input
+            ref={imageInputRef}
+            type="file"
+            accept={IMAGE_MIME_TYPES.join(",")}
+            hidden
+            disabled={isBusy}
+            aria-label="Choose image"
+            onChange={(event) => {
+              const files = event.currentTarget.files;
+              if (!files?.length) return;
+              const file = files[0];
+              const problem = files.length !== 1 ? "Choose one image at a time." : imageFileError(file);
+              if (problem) {
+                removeImage();
+                setImageError(problem);
+                return;
+              }
+              setImageError(null);
+              setSelectedImage({ file, url: URL.createObjectURL(file) });
+            }}
+          />
+          {selectedImage && (
+            <div className="image-upload-preview">
+              <Image src={selectedImage.url} alt="Selected image preview" width={72} height={72} unoptimized />
+              <span>{selectedImage.file.name}</span>
+              <button type="button" onClick={removeImage} disabled={isBusy} aria-label="Remove image">Remove image</button>
+            </div>
+          )}
+          {imageError && (
+            <div className="image-upload-error" role="alert">
+              <span>{imageError}</span>
+              <button type="button" onClick={removeImage}>Dismiss</button>
+            </div>
+          )}
           <div className="command-input-row">
+            <button type="button" className="image-upload-attach" aria-label="Attach image" disabled={isBusy} onClick={() => imageInputRef.current?.click()}>+</button>
             <textarea
               rows={1}
               aria-label="Message KINO"
@@ -1031,7 +1103,7 @@ export default function Home() {
             {isBusy ? (
               <button type="button" aria-label="Stop response" onClick={() => activeRequestRef.current?.abort()}>Stop</button>
             ) : (
-              <button type="submit" aria-label="Send message" disabled={!input.trim()}>
+              <button type="submit" aria-label="Send message" disabled={Boolean(imageError) || (!input.trim() && !selectedImage)}>
                 Send <span className="send-arrow" aria-hidden="true">{ "\u2191" }</span>
               </button>
             )}

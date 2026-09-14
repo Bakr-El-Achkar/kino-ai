@@ -3,6 +3,7 @@ import { safeToolActivity } from "@/lib/kino/activity-server";
 import { InferenceConfigurationError, parseReasoningMode, resolveInference } from "@/lib/kino/ollama/inference";
 import { CHAT_STREAM_HEADERS, encodeChatEvent, type ChatStreamEvent } from "@/lib/kino/chat-stream";
 import { readOllamaRound, streamChatResponse } from "@/lib/kino/ollama/final-stream";
+import { ImageUploadError, parseUserImage, streamUserImage } from "@/lib/kino/ollama/user-image";
 import { observeBrowser, openBrowserUrl } from "@/lib/kino/browser-worker/client";
 import { formatBrowserToolResponse, unwrapToolResult } from "@/lib/kino/browser-worker/response";
 import { browserRuntimeStateMessage, requestedBrowserUrl } from "@/lib/kino/browser-worker/routing";
@@ -149,8 +150,8 @@ export async function POST(request: Request) {
   let aiTransportStage: AiTransportStage = "NOT_STARTED";
   try {
     const body = (await request.json()) as Record<string, unknown>;
+    const image = parseUserImage(body);
     const reasoningMode = parseReasoningMode(body.reasoningMode);
-    const inference = resolveInference(reasoningMode);
     const incoming = body.messages;
     if (!Array.isArray(incoming) || incoming.length === 0) {
       return Response.json({ error: "No conversation messages were provided." }, { status: 400 });
@@ -170,6 +171,9 @@ export async function POST(request: Request) {
       }
     }
 
+    if (image) return streamUserImage(messages, image, request.signal);
+
+    const inference = resolveInference(reasoningMode);
     const directUrl = requestedBrowserUrl(latestMessage);
     if (directUrl && directOpenRequest(latestMessage, directUrl)) {
       return streamChatResponse(request.signal, MAX_RUNTIME_MS - (Date.now() - requestStartedAt), async (publish) => {
@@ -332,6 +336,9 @@ export async function POST(request: Request) {
       return finish(`KINO reached the configured maximum of ${MAX_BROWSER_STEPS} browser steps without completing the goal.`);
     });
   } catch (error) {
+    if (error instanceof ImageUploadError) {
+      return Response.json({ error: error.message }, { status: error.status });
+    }
     if (error instanceof InferenceConfigurationError) {
       return Response.json({ error: error.message, code: error.code }, {
         status: error.code === "INVALID_REASONING_MODE" ? 400 : 503,
